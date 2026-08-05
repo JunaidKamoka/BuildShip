@@ -1,0 +1,53 @@
+name: MailBoxShip
+options:
+  bundleIdPrefix: dev.mailboxship
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.10"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    # Universal: runs natively on both Apple Silicon and Intel.
+    ARCHS: "$(ARCHS_STANDARD)"
+    ONLY_ACTIVE_ARCH: NO
+
+    # Ad-hoc signed, and deliberately not tied to any developer account.
+    # This is a local tool that drives someone else's signing assets; giving
+    # it an identity of its own would be the exact coupling it exists to avoid.
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGNING_ALLOWED: YES
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  MailBoxShip:
+    type: application
+    platform: macOS
+    sources:
+      - path: MailBoxShip
+        excludes:
+          - "**/.DS_Store"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.mailboxship.app
+        INFOPLIST_FILE: MailBoxShip/Resources/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # No App Sandbox. The tool runs xcodebuild, reads a project anywhere on
+        # disk and manages a temporary keychain; a sandbox would block all
+        # three, and sandboxing a developer tool that shells out buys nothing.
+        ENABLE_HARDENED_RUNTIME: NO
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+
+schemes:
+  MailBoxShip:
+    build:
+      targets:
+        MailBoxShip: all
+    run:
+      config: Debug
+    archive:
+      config: Release
