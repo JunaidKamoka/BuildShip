@@ -891,20 +891,13 @@ struct AdvancedView: View {
             return
         }
 
-        var info = ProjectInspector.Info()
-        info.schemes = schemes
-
         // Keep the chosen scheme if it is still valid, so re-detecting is not
         // a reset of the user's decision.
         let scheme = schemes.contains(store.current.scheme) ? store.current.scheme : schemes[0]
         if store.current.scheme != scheme { store.binding(\.scheme).wrappedValue = scheme }
 
-        let settings = await ProjectInspector.inspect(projectPath: path, scheme: scheme)
-        info.bundleID = settings.bundleID
-        info.extensionBundleIDs = settings.extensionBundleIDs
-        info.marketingVersion = settings.marketingVersion
-        info.buildNumber = settings.buildNumber
-        info.entitlements = settings.entitlements
+        var info = await ProjectInspector.inspect(projectPath: path, scheme: scheme)
+        info.schemes = schemes
         detected = info
 
         if adopting, !info.bundleID.isEmpty {

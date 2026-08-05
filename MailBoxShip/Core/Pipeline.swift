@@ -229,6 +229,11 @@ struct Pipeline {
     ) async throws -> String {
         try prepareWorkspace()
         try await archive(team: context.team, buildNumberOverride: buildNumberOverride)
+        // Stamp before signing: the stamp rewrites Info.plist, which would
+        // invalidate a signature already sealed over it.
+        stampVersion(inArchiveAt: archivePath,
+                     buildNumber: buildNumberOverride ?? input.buildNumber)
+        await embedEntitlements(inArchiveAt: archivePath, team: context.team)
 
         // The archive is the first place a companion watch app becomes visible,
         // so top up the profile map from what was actually built before signing.
@@ -256,16 +261,22 @@ struct Pipeline {
         defer { Task { await keychain.destroy(log: log) } }
         let context = try await prepare(keychain: keychain)
 
-        // Start one above whatever App Store Connect already holds, so the usual
-        // case — re-shipping a version whose build number is taken — needs no
-        // wasted first build. Only when the build number was left to the
-        // project; an explicit one is honoured, and still bumped below if it
-        // clashes anyway.
+        // Ask App Store Connect what it already holds *before* archiving, and
+        // start above it. A clash found at validation has already cost a full
+        // build — and an explicitly configured number is exactly the case that
+        // needs checking, since it stays whatever it was until someone edits it,
+        // so it clashes on every ship after the first.
         var buildOverride: String?
-        if input.buildNumber.isEmpty,
-           let next = await nextFreeBuildNumber(client: context.client) {
-            buildOverride = next
-            log("→ App Store Connect already has builds for this app; starting at build \(next).\n")
+        if let highest = await highestBuildNumber(client: context.client) {
+            let free = String(highest + 1)
+            if input.buildNumber.isEmpty {
+                buildOverride = free
+                log("→ App Store Connect already holds build \(highest); building \(free).\n")
+            } else if let requested = Int(input.buildNumber), requested <= highest {
+                buildOverride = free
+                log("→ Build \(input.buildNumber) is already used on App Store Connect; "
+                    + "building \(free) instead.\n")
+            }
         }
 
         var rebuilds = 0
@@ -306,13 +317,12 @@ struct Pipeline {
     /// app, or nil when there is nothing to go on — a brand-new app, or build
     /// numbers that are not plain integers — in which case the project's own
     /// number stands and any clash is caught and fixed after the fact.
-    private func nextFreeBuildNumber(client: ASCClient) async -> String? {
+    private func highestBuildNumber(client: ASCClient) async -> Int? {
         guard !input.bundleID.isEmpty,
               let appID = try? await client.appID(bundleID: input.bundleID),
-              let builds = try? await client.builds(appID: appID),
-              let highest = builds.compactMap({ Int($0.version) }).max()
+              let builds = try? await client.builds(appID: appID)
         else { return nil }
-        return String(highest + 1)
+        return builds.compactMap { Int($0.version) }.max()
     }
 
     // MARK: - Preflight
@@ -780,32 +790,38 @@ struct Pipeline {
         return mapping
     }
 
-    /// Every bundle id inside the archive's app: the host, its extensions, an
-    /// embedded watch app and anything that app embeds in turn. Read from each
-    /// bundle's own Info.plist, so it reflects what was built, not what was
-    /// predicted.
-    private func embeddedBundleIDs(inArchiveAt archive: String) -> [String] {
+    /// The Info.plist at the root of every bundle inside the archive's app: the
+    /// host, its extensions, an embedded watch app and anything that app embeds
+    /// in turn.
+    ///
+    /// iOS keeps a bundle's Info.plist at its root (`X.app/Info.plist`); macOS
+    /// keeps it under `X.app/Contents/Info.plist`. Accept both, but nothing
+    /// deeper — a framework's own Info.plist is not a target.
+    private func bundleRootInfoPlists(inArchiveAt archive: String) -> [String] {
         let root = (archive as NSString).appendingPathComponent("Products/Applications")
-        let fm = FileManager.default
-        guard let walker = fm.enumerator(atPath: root) else { return [] }
+        guard let walker = FileManager.default.enumerator(atPath: root) else { return [] }
 
-        var ids = Set<String>()
+        var paths: [String] = []
         for case let relative as String in walker {
             guard (relative as NSString).lastPathComponent == "Info.plist" else { continue }
             let directory = (relative as NSString).deletingLastPathComponent as NSString
             let container = directory.lastPathComponent
-            // iOS keeps a bundle's Info.plist at its root (`X.app/Info.plist`);
-            // macOS keeps it under `X.app/Contents/Info.plist`. Accept both, but
-            // nothing deeper — a framework's own Info.plist is not a target that
-            // needs a profile.
             let parent = (directory.deletingLastPathComponent as NSString).lastPathComponent
             let atBundleRoot = container.hasSuffix(".app") || container.hasSuffix(".appex")
             let atMacBundleRoot = container == "Contents"
                 && (parent.hasSuffix(".app") || parent.hasSuffix(".appex"))
             guard atBundleRoot || atMacBundleRoot else { continue }
+            paths.append((root as NSString).appendingPathComponent(relative))
+        }
+        return paths
+    }
 
-            let full = (root as NSString).appendingPathComponent(relative)
-            if let data = fm.contents(atPath: full),
+    /// Every bundle id inside the archive's app, read from each bundle's own
+    /// Info.plist, so it reflects what was built, not what was predicted.
+    private func embeddedBundleIDs(inArchiveAt archive: String) -> [String] {
+        var ids = Set<String>()
+        for path in bundleRootInfoPlists(inArchiveAt: archive) {
+            if let data = FileManager.default.contents(atPath: path),
                let plist = try? PropertyListSerialization.propertyList(
                    from: data, format: nil) as? [String: Any],
                let id = plist["CFBundleIdentifier"] as? String, !id.isEmpty {
@@ -813,6 +829,108 @@ struct Pipeline {
             }
         }
         return Array(ids)
+    }
+
+    /// Embed each bundle's declared entitlements into the archive.
+    ///
+    /// Entitlements are written *by* codesign, and the archive is deliberately
+    /// built unsigned — so nothing the project declares is in it, and
+    /// `-exportArchive` then signs from the provisioning profile alone. The
+    /// shipped app comes out carrying only `com.apple.application-identifier`
+    /// and `com.apple.developer.team-identifier`: App Sandbox, keychain groups,
+    /// app groups and the rest are gone. macOS catches that at validation
+    /// ("App sandbox not enabled"); iOS does not, and uploads an app that
+    /// installs and then fails at runtime wherever a missing entitlement bites.
+    ///
+    /// Signing ad-hoc here is only a carrier — export re-signs with the real
+    /// identity and the per-bundle profiles, and keeps the entitlements it
+    /// finds. Archiving ad-hoc instead would be simpler, but Xcode refuses:
+    /// a target declaring entitlements demands a provisioning profile at build
+    /// time, which is exactly what signing at export exists to avoid.
+    private func embedEntitlements(inArchiveAt archive: String, team: String) async {
+        // Deepest first: codesign requires nested bundles to be signed before
+        // the bundle that contains them.
+        let bundles = archivedBundles(inArchiveAt: archive)
+            .sorted { $0.bundle.count > $1.bundle.count }
+
+        for (bundle, plistPath) in bundles {
+            guard let data = FileManager.default.contents(atPath: plistPath),
+                  let plist = try? PropertyListSerialization.propertyList(
+                      from: data, format: nil) as? [String: Any],
+                  let identifier = plist["CFBundleIdentifier"] as? String
+            else { continue }
+
+            let source = input.entitlementsPath(for: identifier)
+            guard !source.isEmpty,
+                  let declared = try? String(contentsOfFile: source, encoding: .utf8)
+            else { continue }
+
+            // Xcode expands these from the provisioning profile as it signs;
+            // codesign does not, and would embed the literal `$(...)` text.
+            let expanded = declared
+                .replacingOccurrences(of: "$(AppIdentifierPrefix)", with: "\(team).")
+                .replacingOccurrences(of: "$(TeamIdentifierPrefix)", with: "\(team).")
+
+            let resolved = work.appendingPathComponent(
+                "build/entitlements-\(Self.pathSafe(identifier)).plist")
+            guard (try? expanded.write(to: resolved, atomically: true, encoding: .utf8)) != nil
+            else { continue }
+
+            let result = await Shell.run("/usr/bin/codesign", [
+                "--force", "--sign", "-", "--entitlements", resolved.path, bundle,
+            ])
+            if result.succeeded {
+                log("  Entitlements embedded for \(identifier)\n")
+            } else {
+                log("  ⚠︎ Could not embed entitlements for \(identifier) — the upload will "
+                    + "be missing them.\n\(result.output)\n")
+            }
+        }
+    }
+
+    /// The bundles inside the archive's app, each with its own Info.plist.
+    private func archivedBundles(inArchiveAt archive: String) -> [(bundle: String, plist: String)] {
+        bundleRootInfoPlists(inArchiveAt: archive).map { plist in
+            let directory = (plist as NSString).deletingLastPathComponent
+            // macOS nests the plist one deeper, under `X.app/Contents`.
+            let isMac = (directory as NSString).lastPathComponent == "Contents"
+            return (isMac ? (directory as NSString).deletingLastPathComponent : directory, plist)
+        }
+    }
+
+    /// Write the version and build number into the archive itself.
+    ///
+    /// `CURRENT_PROJECT_VERSION` on the command line only reaches the built app
+    /// when its Info.plist asks for it — a generated plist, or a literal one
+    /// written as `$(CURRENT_PROJECT_VERSION)`. A project that instead hardcodes
+    /// `<string>1</string>` ignores the override completely, and nothing says
+    /// so: every rebuild ships the same number, App Store Connect rejects each
+    /// one as already used, and the automatic bump loops until it gives up
+    /// having burned a full build per attempt. Stamping the archive is the one
+    /// place that works whatever the project does.
+    ///
+    /// Safe because the archive is built unsigned and export signs it
+    /// afterwards. Extensions are stamped too — Apple rejects an upload whose
+    /// extension build number differs from its host app's.
+    private func stampVersion(inArchiveAt archive: String, buildNumber: String) {
+        guard !buildNumber.isEmpty || !input.marketingVersion.isEmpty else { return }
+
+        for path in bundleRootInfoPlists(inArchiveAt: archive) {
+            var format = PropertyListSerialization.PropertyListFormat.xml
+            guard let data = FileManager.default.contents(atPath: path),
+                  var plist = try? PropertyListSerialization.propertyList(
+                      from: data, format: &format) as? [String: Any]
+            else { continue }
+
+            if !buildNumber.isEmpty { plist["CFBundleVersion"] = buildNumber }
+            if !input.marketingVersion.isEmpty {
+                plist["CFBundleShortVersionString"] = input.marketingVersion
+            }
+            if let updated = try? PropertyListSerialization.data(
+                fromPropertyList: plist, format: format, options: 0) {
+                try? updated.write(to: URL(fileURLWithPath: path))
+            }
+        }
     }
 
     // MARK: - Build
