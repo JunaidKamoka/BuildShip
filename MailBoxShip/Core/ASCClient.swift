@@ -22,7 +22,7 @@ struct ASCClient {
     var proxyDictionary: [AnyHashable: Any]?
 
     private let base = "https://api.appstoreconnect.apple.com"
-
+ 
     /// A session per client, so a proxy applies to these calls without
     /// touching `URLSession.shared` — which other parts of the app use.
     private var session: URLSession {
