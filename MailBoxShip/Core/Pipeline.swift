@@ -233,7 +233,7 @@ struct Pipeline {
         // invalidate a signature already sealed over it.
         stampVersion(inArchiveAt: archivePath,
                      buildNumber: buildNumberOverride ?? input.buildNumber)
-        await embedEntitlements(inArchiveAt: archivePath, team: context.team)
+        try await embedEntitlements(inArchiveAt: archivePath, team: context.team)
 
         // The archive is the first place a companion watch app becomes visible,
         // so top up the profile map from what was actually built before signing.
@@ -847,45 +847,207 @@ struct Pipeline {
     /// finds. Archiving ad-hoc instead would be simpler, but Xcode refuses:
     /// a target declaring entitlements demands a provisioning profile at build
     /// time, which is exactly what signing at export exists to avoid.
-    private func embedEntitlements(inArchiveAt archive: String, team: String) async {
-        // Deepest first: codesign requires nested bundles to be signed before
-        // the bundle that contains them.
+    private func embedEntitlements(inArchiveAt archive: String, team: String) async throws {
+        // Deepest first: codesign requires a nested bundle to be signed before
+        // the bundle that contains it.
+        // Deepest first, so a bundle is always signed after everything it
+        // contains — codesign will not seal a bundle around unsigned code.
         let bundles = archivedBundles(inArchiveAt: archive)
             .sorted { $0.bundle.count > $1.bundle.count }
 
-        for (bundle, plistPath) in bundles {
-            guard let data = FileManager.default.contents(atPath: plistPath),
-                  let plist = try? PropertyListSerialization.propertyList(
-                      from: data, format: nil) as? [String: Any],
-                  let identifier = plist["CFBundleIdentifier"] as? String
+        var declared: [(path: String, id: String, file: URL, keys: Set<String>)] = []
+        for (path, plist) in bundles {
+            guard let identifier = bundleIdentifier(atPlist: plist),
+                  let resolved = try await resolvedEntitlements(for: identifier, team: team)
             else { continue }
+            declared.append((path, identifier, resolved.file, resolved.keys))
+        }
 
-            let source = input.entitlementsPath(for: identifier)
-            guard !source.isEmpty,
-                  let declared = try? String(contentsOfFile: source, encoding: .utf8)
-            else { continue }
+        // A project that declares no entitlements anywhere needs no signing
+        // here — leave the archive exactly as export has always received it.
+        guard !declared.isEmpty else { return }
 
-            // Xcode expands these from the provisioning profile as it signs;
-            // codesign does not, and would embed the literal `$(...)` text.
-            let expanded = declared
-                .replacingOccurrences(of: "$(AppIdentifierPrefix)", with: "\(team).")
-                .replacingOccurrences(of: "$(TeamIdentifierPrefix)", with: "\(team).")
-
-            let resolved = work.appendingPathComponent(
-                "build/entitlements-\(Self.pathSafe(identifier)).plist")
-            guard (try? expanded.write(to: resolved, atomically: true, encoding: .utf8)) != nil
-            else { continue }
-
-            let result = await Shell.run("/usr/bin/codesign", [
-                "--force", "--sign", "-", "--entitlements", resolved.path, bundle,
-            ])
-            if result.succeeded {
-                log("  Entitlements embedded for \(identifier)\n")
-            } else {
-                log("  ⚠︎ Could not embed entitlements for \(identifier) — the upload will "
-                    + "be missing them.\n\(result.output)\n")
+        // Nested code first. A failure here is reported but not fatal: if it
+        // actually matters, sealing the bundle around it fails next and that
+        // *is* fatal, with a better message than this loop could give.
+        for nested in nestedCode(inArchiveAt: archive).sorted(by: { $0.count > $1.count }) {
+            let result = await Shell.run("/usr/bin/codesign", ["--force", "--sign", "-", nested])
+            if !result.succeeded {
+                log("  ⚠︎ Could not sign \((nested as NSString).lastPathComponent)\n")
             }
         }
+
+        // Then every bundle — with its entitlements where it declares them, bare
+        // where it does not. A nested app or extension that declares none still
+        // has to be signed, or the bundle containing it cannot be sealed.
+        let entitlementsByPath = Dictionary(
+            declared.map { ($0.path, $0.file) }, uniquingKeysWith: { first, _ in first })
+        for (path, _) in bundles {
+            var arguments = ["--force", "--sign", "-"]
+            if let file = entitlementsByPath[path] {
+                arguments += ["--entitlements", file.path]
+            }
+            arguments.append(path)
+
+            let result = await Shell.run("/usr/bin/codesign", arguments)
+            guard result.succeeded else {
+                throw ShipError("Could not sign \((path as NSString).lastPathComponent) inside "
+                    + "the archive, so its entitlements would have been dropped and Apple would "
+                    + "reject or silently break the app.\n\(result.output)")
+            }
+        }
+
+        // Trust nothing: read back what each bundle actually carries. A codesign
+        // that exits zero having quietly attached nothing is the failure this
+        // whole step exists to prevent.
+        for target in declared {
+            let embedded = await embeddedEntitlementKeys(at: target.path)
+            let missing = target.keys.subtracting(embedded).sorted()
+            guard missing.isEmpty else {
+                throw ShipError("\(target.id) was signed but is missing "
+                    + "\(missing.joined(separator: ", ")). Nothing was uploaded.")
+            }
+            log("  Entitlements embedded for \(target.id) "
+                + "(\(target.keys.count) key\(target.keys.count == 1 ? "" : "s"))\n")
+        }
+    }
+
+    /// What a signed bundle actually carries, read back from its signature.
+    private func embeddedEntitlementKeys(at bundle: String) async -> Set<String> {
+        let dump = work.appendingPathComponent("build/embedded-entitlements.plist")
+        try? FileManager.default.removeItem(at: dump)
+        _ = await Shell.run(
+            "/usr/bin/codesign", ["-d", "--entitlements", dump.path, "--xml", bundle])
+
+        guard let data = FileManager.default.contents(atPath: dump.path),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, format: nil) as? [String: Any]
+        else { return [] }
+        return Set(plist.keys)
+    }
+
+    /// Code inside a bundle that is not itself one of the bundles above:
+    /// embedded frameworks, loadable dylibs, XPC services and plug-ins.
+    private func nestedCode(inArchiveAt archive: String) -> [String] {
+        let signable = [".framework", ".dylib", ".so", ".xpc",
+                        ".systemextension", ".pluginkit", ".plugin", ".qlgenerator", ".bundle"]
+        let root = (archive as NSString).appendingPathComponent("Products/Applications")
+        guard let walker = FileManager.default.enumerator(atPath: root) else { return [] }
+
+        var paths: [String] = []
+        for case let relative as String in walker {
+            let name = (relative as NSString).lastPathComponent
+            guard signable.contains(where: { name.hasSuffix($0) }) else { continue }
+            paths.append((root as NSString).appendingPathComponent(relative))
+        }
+        return paths
+    }
+
+    private func bundleIdentifier(atPlist path: String) -> String? {
+        guard let data = FileManager.default.contents(atPath: path),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, format: nil) as? [String: Any],
+              let identifier = plist["CFBundleIdentifier"] as? String, !identifier.isEmpty
+        else { return nil }
+        return identifier
+    }
+
+    /// A bundle's declared entitlements, written out with Xcode's build
+    /// variables resolved.
+    ///
+    /// Xcode expands `$(AppIdentifierPrefix)` and `$(TeamIdentifierPrefix)` from
+    /// the provisioning profile as it signs. codesign expands nothing, and would
+    /// embed the literal text — which passes validation and then fails at
+    /// runtime, where a keychain group reading `$(AppIdentifierPrefix)com.x.y`
+    /// simply never matches.
+    private func resolvedEntitlements(
+        for identifier: String, team: String,
+    ) async throws -> (file: URL, keys: Set<String>)? {
+        // No entitlements declared is normal and not a problem.
+        let source = input.entitlementsPath(for: identifier)
+        guard !source.isEmpty else { return nil }
+
+        // Declared but unreadable is a problem, and a silent skip here is how an
+        // app ships stripped of everything it asked for.
+        guard let declared = try? String(contentsOfFile: source, encoding: .utf8) else {
+            throw ShipError("\(identifier) points at an entitlements file that could not be "
+                + "read: \(source)")
+        }
+
+        var expanded = declared
+            .replacingOccurrences(of: "$(AppIdentifierPrefix)", with: "\(team).")
+            .replacingOccurrences(of: "$(TeamIdentifierPrefix)", with: "\(team).")
+            .replacingOccurrences(of: "$(DEVELOPMENT_TEAM)", with: team)
+            .replacingOccurrences(of: "$(CFBundleIdentifier)", with: identifier)
+            .replacingOccurrences(of: "$(PRODUCT_BUNDLE_IDENTIFIER)", with: identifier)
+
+        // What is left is a setting the project defines itself, like a
+        // `$(BASE_PACKAGE_IDENTIFIER)` shared between an app and its extensions.
+        // Those are perfectly real — just not names this tool knows — so ask the
+        // project rather than refuse to ship. Only asked when one turns up:
+        // `-showBuildSettings` is not cheap on a large project.
+        if Self.firstBuildVariable(in: expanded) != nil {
+            expanded = await expandProjectVariables(in: expanded)
+        }
+
+        // Xcode expands build variables as it signs; codesign expands nothing
+        // and would embed the literal text. That passes validation and fails at
+        // runtime, where a keychain group reading `$(Whatever)com.x.y` simply
+        // never matches — the worst possible place to find out.
+        if let leftover = Self.firstBuildVariable(in: expanded) {
+            throw ShipError("\((source as NSString).lastPathComponent) uses \(leftover), which "
+                + "this tool cannot resolve. Replace it with a literal value and ship again.")
+        }
+
+        guard let data = expanded.data(using: .utf8),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, format: nil) as? [String: Any]
+        else {
+            throw ShipError("\((source as NSString).lastPathComponent) is not a readable "
+                + "property list.")
+        }
+
+        let destination = work.appendingPathComponent(
+            "build/entitlements-\(Self.pathSafe(identifier)).plist")
+        guard (try? expanded.write(to: destination, atomically: true, encoding: .utf8)) != nil
+        else {
+            throw ShipError("Could not stage the entitlements for \(identifier).")
+        }
+        return (destination, Set(plist.keys))
+    }
+
+    /// Resolve `$(SETTING)` against the project's own resolved build settings.
+    ///
+    /// Every target's settings are merged, because an entitlements file names
+    /// settings defined on the target that owns it, not necessarily on the app.
+    /// Anything still unresolved is left in place for the caller to reject.
+    private func expandProjectVariables(in text: String) async -> String {
+        let info = await ProjectInspector.inspect(
+            projectPath: input.projectPath, scheme: input.scheme)
+
+        var merged: [String: String] = [:]
+        for (_, settings) in info.buildSettings {
+            merged.merge(settings) { existing, _ in existing }
+        }
+
+        // Bounded: a setting whose value names another setting would otherwise
+        // loop, and xcodebuild is not guaranteed to have resolved every one.
+        var result = text
+        for _ in 0..<16 {
+            guard let variable = Self.firstBuildVariable(in: result),
+                  let value = merged[String(variable.dropFirst(2).dropLast())]
+            else { break }
+            result = result.replacingOccurrences(of: variable, with: value)
+        }
+        return result
+    }
+
+    /// The first `$(BUILD_VARIABLE)` left in a string, if any.
+    private static func firstBuildVariable(in text: String) -> String? {
+        guard let range = text.range(of: "\\$\\([A-Za-z_][A-Za-z0-9_]*\\)",
+                                     options: .regularExpression)
+        else { return nil }
+        return String(text[range])
     }
 
     /// The bundles inside the archive's app, each with its own Info.plist.
