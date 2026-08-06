@@ -36,6 +36,11 @@ enum ProjectInspector {
         /// Absolute entitlements path per bundle id, so each App ID can be
         /// given exactly the capabilities its own target asks for.
         var entitlements: [String: String] = [:]
+        /// Resolved build settings per bundle id. Entitlements files reference
+        /// project-defined settings — a `$(BASE_PACKAGE_IDENTIFIER)` shared
+        /// between an app and its extensions — and only the project can say
+        /// what those are worth.
+        var buildSettings: [String: [String: String]] = [:]
 
         var summary: String {
             var parts: [String] = []
@@ -232,6 +237,8 @@ enum ProjectInspector {
             // The wrapper extension distinguishes the app from what it embeds:
             // ".app" for the host, ".appex" for extensions.
             let wrapper = settings["WRAPPER_EXTENSION"] as? String ?? ""
+
+            info.buildSettings[bundle] = settings.compactMapValues { $0 as? String }
 
             // xcodebuild reports CODE_SIGN_ENTITLEMENTS relative to the project
             // directory; resolve it so the file can actually be read.
