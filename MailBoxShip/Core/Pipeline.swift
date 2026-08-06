@@ -176,7 +176,7 @@ struct Pipeline {
         defer { Task { await keychain.destroy(log: log) } }
 
         let context = try await prepare(keychain: keychain)
-        return try await assemble(context, buildNumberOverride: nil)
+        return try await assemble(context, versionOverride: nil, buildNumberOverride: nil)
     }
 
     /// Team, signing certificate and provisioning profiles — the account work a
@@ -225,13 +225,15 @@ struct Pipeline {
     /// Archive and export a signed .ipa. Repeatable with a different build
     /// number without redoing the account setup in `prepare`.
     private func assemble(
-        _ context: BuildContext, buildNumberOverride: String?,
+        _ context: BuildContext, versionOverride: String?, buildNumberOverride: String?,
     ) async throws -> String {
         try prepareWorkspace()
-        try await archive(team: context.team, buildNumberOverride: buildNumberOverride)
+        try await archive(team: context.team, versionOverride: versionOverride,
+                          buildNumberOverride: buildNumberOverride)
         // Stamp before signing: the stamp rewrites Info.plist, which would
         // invalidate a signature already sealed over it.
         stampVersion(inArchiveAt: archivePath,
+                     version: versionOverride ?? input.marketingVersion,
                      buildNumber: buildNumberOverride ?? input.buildNumber)
         try await embedEntitlements(inArchiveAt: archivePath, team: context.team)
 
@@ -257,32 +259,64 @@ struct Pipeline {
                 + "Choose the .p8 again for this profile and try once more.")
         }
 
-        let keychain = EphemeralKeychain()
-        defer { Task { await keychain.destroy(log: log) } }
-        let context = try await prepare(keychain: keychain)
+        // Match the version and build number with the store *first*, before
+        // any account setup or compiling. A clash found at validation has
+        // already cost a full build — and a configured version or build number
+        // is exactly the case that needs checking, since it stays whatever it
+        // was until someone edits it, so it clashes on every ship after the
+        // first. The client here needs nothing but the key, so this can be the
+        // genuine first step.
+        let client = ASCClient(
+            keyID: input.keyID, issuerID: input.issuerID,
+            privateKeyPath: input.keyPath, proxyDictionary: input.proxyDictionary,
+        )
 
-        // Ask App Store Connect what it already holds *before* archiving, and
-        // start above it. A clash found at validation has already cost a full
-        // build — and an explicitly configured number is exactly the case that
-        // needs checking, since it stays whatever it was until someone edits it,
-        // so it clashes on every ship after the first.
+        log("→ Matching version and build number with the App Store…\n")
+
+        // Marketing version: must be strictly above the last approved release,
+        // or Apple refuses the upload as 90062 ("must contain a higher version
+        // than that of the previously approved version") / 90186 ("train closed
+        // for new build submissions").
+        var versionOverride: String?
+        let configuredVersion = await effectiveMarketingVersion()
+        if let approved = await highestApprovedVersion(client: client) {
+            if configuredVersion.isEmpty
+                || Self.compareVersions(configuredVersion, approved) <= 0 {
+                let bumped = Self.bumpedVersion(approved)
+                versionOverride = bumped
+                log("  Store already has \(approved) — shipping as \(bumped).\n")
+            } else {
+                log("  Store has \(approved); \(configuredVersion) is higher — keeping it.\n")
+            }
+        } else {
+            log("  No approved version on the store yet — keeping "
+                + (configuredVersion.isEmpty ? "the project's version" : configuredVersion)
+                + ".\n")
+        }
+
+        // Build number: must be above every build App Store Connect holds.
         var buildOverride: String?
-        if let highest = await highestBuildNumber(client: context.client) {
+        if let highest = await highestBuildNumber(client: client) {
             let free = String(highest + 1)
             if input.buildNumber.isEmpty {
                 buildOverride = free
-                log("→ App Store Connect already holds build \(highest); building \(free).\n")
+                log("  App Store Connect already holds build \(highest); building \(free).\n")
             } else if let requested = Int(input.buildNumber), requested <= highest {
                 buildOverride = free
-                log("→ Build \(input.buildNumber) is already used on App Store Connect; "
+                log("  Build \(input.buildNumber) is already used on App Store Connect; "
                     + "building \(free) instead.\n")
             }
         }
 
+        let keychain = EphemeralKeychain()
+        defer { Task { await keychain.destroy(log: log) } }
+        let context = try await prepare(keychain: keychain)
+
         var rebuilds = 0
         let maxRebuilds = 5
         while true {
-            let ipa = try await assemble(context, buildNumberOverride: buildOverride)
+            let ipa = try await assemble(
+                context, versionOverride: versionOverride, buildNumberOverride: buildOverride)
 
             onStage(.validate)
             log("\n→ Validating before upload…\n")
@@ -300,6 +334,25 @@ struct Pipeline {
             case .buildNumberTaken(let next):
                 throw ShipError("Bumped the build number up to \(next) but App Store Connect "
                     + "kept reporting it as already used. Nothing was uploaded.")
+
+            case .versionTooLow(let approved) where rebuilds < maxRebuilds:
+                // The pre-archive check can miss — lookup lag, a version
+                // approved mid-run — so the refusal is handled here too rather
+                // than surfaced as a dead end.
+                rebuilds += 1
+                let shipped = versionOverride ?? configuredVersion
+                let floor = [approved, shipped.isEmpty ? nil : shipped]
+                    .compactMap { $0 }
+                    .max { Self.compareVersions($0, $1) < 0 } ?? "1.0"
+                let bumped = Self.bumpedVersion(floor)
+                versionOverride = bumped
+                log("\n↻ Version \(shipped.isEmpty ? floor : shipped) is closed on the "
+                    + "App Store — rebuilding as \(bumped) automatically…\n")
+                continue
+
+            case .versionTooLow:
+                throw ShipError("Raised the version \(rebuilds) times but App Store Connect "
+                    + "kept refusing it as not above the approved release. Nothing was uploaded.")
 
             case .failed(let message):
                 throw ShipError(message + " Nothing was uploaded, so no build number was used.")
@@ -323,6 +376,58 @@ struct Pipeline {
               let builds = try? await client.builds(appID: appID)
         else { return nil }
         return builds.compactMap { Int($0.version) }.max()
+    }
+
+    /// The version this run would ship without an override: the profile's, or
+    /// the project's own `MARKETING_VERSION` when the field is left blank.
+    private func effectiveMarketingVersion() async -> String {
+        if !input.marketingVersion.isEmpty { return input.marketingVersion }
+        return await ProjectInspector.inspect(
+            projectPath: input.projectPath, scheme: input.scheme).marketingVersion
+    }
+
+    /// The highest version the store already holds, or nil when there is
+    /// nothing to go on — a brand-new app, or the network refusing both looks.
+    ///
+    /// Two sources, deliberately: the public iTunes lookup is the live store
+    /// as a customer sees it, and the App Store Connect version list adds
+    /// releases that are approved but not yet visible there. Either alone has
+    /// a blind spot; the maximum of both is what a new version must exceed.
+    private func highestApprovedVersion(client: ASCClient) async -> String? {
+        guard !input.bundleID.isEmpty else { return nil }
+
+        var versions: [String] = []
+        if let live = await client.liveStoreVersion(bundleID: input.bundleID) {
+            versions.append(live)
+        }
+        if let appID = try? await client.appID(bundleID: input.bundleID) {
+            versions += await client.closedTrainVersions(appID: appID)
+        }
+        return versions.max { Self.compareVersions($0, $1) < 0 }
+    }
+
+    /// Component-wise numeric comparison: "1.0" < "1.0.1" < "1.1" < "2".
+    /// Plain string comparison gets "1.10" vs "1.9" wrong, which here would
+    /// mean shipping a version Apple refuses.
+    static func compareVersions(_ a: String, _ b: String) -> Int {
+        let lhs = a.split(separator: ".").map { Int($0) ?? 0 }
+        let rhs = b.split(separator: ".").map { Int($0) ?? 0 }
+        for index in 0..<max(lhs.count, rhs.count) {
+            let l = index < lhs.count ? lhs[index] : 0
+            let r = index < rhs.count ? rhs[index] : 0
+            if l != r { return l < r ? -1 : 1 }
+        }
+        return 0
+    }
+
+    /// The next patch version: 1.0 → 1.0.1, 1.2.3 → 1.2.4. Padded to three
+    /// components first, so the bump opens a new release train without
+    /// skipping the minor or major number the developer may be saving.
+    static func bumpedVersion(_ version: String) -> String {
+        var parts = version.split(separator: ".").map { Int($0) ?? 0 }
+        while parts.count < 3 { parts.append(0) }
+        parts[parts.count - 1] += 1
+        return parts.map(String.init).joined(separator: ".")
     }
 
     // MARK: - Preflight
@@ -1074,8 +1179,8 @@ struct Pipeline {
     /// Safe because the archive is built unsigned and export signs it
     /// afterwards. Extensions are stamped too — Apple rejects an upload whose
     /// extension build number differs from its host app's.
-    private func stampVersion(inArchiveAt archive: String, buildNumber: String) {
-        guard !buildNumber.isEmpty || !input.marketingVersion.isEmpty else { return }
+    private func stampVersion(inArchiveAt archive: String, version: String, buildNumber: String) {
+        guard !buildNumber.isEmpty || !version.isEmpty else { return }
 
         for path in bundleRootInfoPlists(inArchiveAt: archive) {
             var format = PropertyListSerialization.PropertyListFormat.xml
@@ -1085,8 +1190,8 @@ struct Pipeline {
             else { continue }
 
             if !buildNumber.isEmpty { plist["CFBundleVersion"] = buildNumber }
-            if !input.marketingVersion.isEmpty {
-                plist["CFBundleShortVersionString"] = input.marketingVersion
+            if !version.isEmpty {
+                plist["CFBundleShortVersionString"] = version
             }
             if let updated = try? PropertyListSerialization.data(
                 fromPropertyList: plist, format: format, options: 0) {
@@ -1108,13 +1213,16 @@ struct Pipeline {
         work.appendingPathComponent("build/App.xcarchive").path
     }
 
-    private func archive(team: String, buildNumberOverride: String? = nil) async throws {
+    private func archive(
+        team: String, versionOverride: String? = nil, buildNumberOverride: String? = nil,
+    ) async throws {
         onStage(.archive)
         log("\n→ Archiving (\(input.configuration.rawValue))… this takes a few minutes\n")
 
         // An override wins over the project's own number; it is how a rebuild
-        // lands on a build number App Store Connect will accept.
+        // lands on a version and build number App Store Connect will accept.
         let buildNumber = buildNumberOverride ?? input.buildNumber
+        let marketingVersion = versionOverride ?? input.marketingVersion
 
         var args = ProjectInspector.container(forProjectPath: input.projectPath).arguments + [
             "-scheme", input.scheme,
@@ -1142,7 +1250,7 @@ struct Pipeline {
             "CODE_SIGN_IDENTITY=",
             "CODE_SIGN_STYLE=Manual",
         ]
-        if !input.marketingVersion.isEmpty { args.append("MARKETING_VERSION=\(input.marketingVersion)") }
+        if !marketingVersion.isEmpty { args.append("MARKETING_VERSION=\(marketingVersion)") }
         if !buildNumber.isEmpty { args.append("CURRENT_PROJECT_VERSION=\(buildNumber)") }
         args.append("archive")
 
@@ -1338,6 +1446,9 @@ struct Pipeline {
         case passed
         /// App Store Connect already has this build number; rebuild as `next`.
         case buildNumberTaken(next: Int)
+        /// The marketing version is not above the last approved release
+        /// (90062 / 90186); rebuild with a higher one.
+        case versionTooLow(approved: String?)
         /// Something else, already in plain language.
         case failed(message: String)
     }
@@ -1353,7 +1464,31 @@ struct Pipeline {
         if let previous = Self.usedBuildNumber(in: result.output) {
             return .buildNumberTaken(next: previous + 1)
         }
+        if Self.versionTrainClosed(in: result.output) {
+            return .versionTooLow(approved: Self.approvedVersion(in: result.output))
+        }
         return .failed(message: Self.humanize(Self.reason(fromAltool: result.output) ?? "Validation failed."))
+    }
+
+    /// Whether altool refused the archive because its marketing version is not
+    /// above the last approved App Store release. Apple reports it as 90062
+    /// ("must contain a higher version than that of the previously approved
+    /// version") and often 90186 ("train … closed for new build submissions")
+    /// together.
+    private static func versionTrainClosed(in output: String) -> Bool {
+        output.contains("90062") || output.contains("90186")
+            || output.contains("previously approved version")
+            || output.contains("closed for new build submissions")
+    }
+
+    /// The approved version Apple named in the refusal:
+    /// "… previously approved version [1.0] …".
+    private static func approvedVersion(in output: String) -> String? {
+        guard let range = output.range(of: "previously approved version [") else { return nil }
+        let tail = output[range.upperBound...]
+        guard let close = tail.firstIndex(of: "]") else { return nil }
+        let version = String(tail[..<close]).trimmingCharacters(in: .whitespaces)
+        return version.isEmpty ? nil : version
     }
 
     /// The build number App Store Connect reports as already used, when that is

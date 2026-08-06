@@ -500,6 +500,61 @@ extension ASCClient {
     }
 }
 
+// MARK: - App Store versions
+
+extension ASCClient {
+
+    /// The version live on the public App Store right now, from the iTunes
+    /// lookup API — public, unauthenticated, and the ground truth for what a
+    /// customer sees.
+    ///
+    /// Best-effort by design: a brand-new app, a region gap, or lookup lag
+    /// returns nothing, and `closedTrainVersions` below covers those from the
+    /// account side. Failing the run over this endpoint would be backwards.
+    func liveStoreVersion(bundleID: String) async -> String? {
+        guard let url = URL(string: "https://itunes.apple.com/lookup?bundleId=\(bundleID)")
+        else { return nil }
+        guard let (data, _) = try? await session.data(from: url),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let results = json["results"] as? [[String: Any]],
+              let version = results.first?["version"] as? String, !version.isEmpty
+        else { return nil }
+        return version
+    }
+
+    /// Version strings whose release trains are closed to new builds:
+    /// approved, released, or already replaced.
+    ///
+    /// The iTunes lookup only shows what is *live*. A version approved but
+    /// pending release — or just released and still propagating — is invisible
+    /// there, yet uploading a build with the same or lower version is refused
+    /// as 90062/90186. This is the account-side view that catches those.
+    /// A version still being prepared or in review is deliberately excluded:
+    /// its train is open, and uploading builds to it is the normal flow.
+    func closedTrainVersions(appID: String) async -> [String] {
+        let closed: Set<String> = [
+            "READY_FOR_SALE", "READY_FOR_DISTRIBUTION",
+            "PENDING_DEVELOPER_RELEASE", "PENDING_APPLE_RELEASE",
+            "PROCESSING_FOR_APP_STORE", "PROCESSING_FOR_DISTRIBUTION",
+            "REPLACED_WITH_NEW_VERSION",
+        ]
+        guard let json = try? await request(
+            "GET", "/v1/apps/\(appID)/appStoreVersions?limit=200")
+        else { return [] }
+
+        return (json["data"] as? [[String: Any]] ?? []).compactMap { item in
+            guard let a = item["attributes"] as? [String: Any],
+                  let version = a["versionString"] as? String, !version.isEmpty
+            else { return nil }
+            // Apple is migrating `appStoreState` to `appVersionState`; accept
+            // whichever this response carries.
+            let state = (a["appVersionState"] as? String)
+                ?? (a["appStoreState"] as? String) ?? ""
+            return closed.contains(state) ? version : nil
+        }
+    }
+}
+
 // MARK: - Beta App Review details
 
 extension ASCClient {
