@@ -316,8 +316,14 @@ struct Pipeline {
         // are one API call each. Explicitly configured values are exactly the
         // ones that need checking: they stay whatever they were until someone
         // edits them, so they clash on every ship after the first.
-        let (buildStart, versionOverride) = await resolveAgainstAppStore(context: context)
+        let (buildStart, versionStart) = await resolveAgainstAppStore(context: context)
         var buildOverride = buildStart
+        var versionOverride = versionStart
+
+        // The version this run ships without an override — the explicit field,
+        // else the project's own, read during preflight.
+        let configuredVersion = input.marketingVersion.isEmpty
+            ? context.projectInfo.marketingVersion : input.marketingVersion
 
         var rebuilds = 0
         let maxRebuilds = 5
@@ -341,6 +347,25 @@ struct Pipeline {
             case .buildNumberTaken(let next):
                 throw ShipError("Bumped the build number up to \(next) but App Store Connect "
                     + "kept reporting it as already used. Nothing was uploaded.")
+
+            case .versionTooLow(let approved) where rebuilds < maxRebuilds:
+                // The pre-archive check can miss — lookup lag, a version
+                // approved mid-run — so the refusal is handled here too rather
+                // than surfaced as a dead end.
+                rebuilds += 1
+                let shipped = versionOverride ?? configuredVersion
+                let floor = [approved, shipped.isEmpty ? nil : shipped]
+                    .compactMap { $0 }
+                    .max(by: Self.versionOrdered) ?? "1.0"
+                let bumped = Self.bumpPatch(floor)
+                versionOverride = bumped
+                log("\n↻ Version \(shipped.isEmpty ? floor : shipped) is closed on the "
+                    + "App Store — rebuilding as \(bumped) automatically…\n")
+                continue
+
+            case .versionTooLow:
+                throw ShipError("Raised the version \(rebuilds) times but App Store Connect "
+                    + "kept refusing it as not above the approved release. Nothing was uploaded.")
 
             case .failed(let message):
                 throw ShipError(message + " Nothing was uploaded, so no build number was used.")
@@ -1600,7 +1625,7 @@ struct Pipeline {
         log("\n→ Archiving (\(input.configuration.rawValue))… this takes a few minutes\n")
 
         // An override wins over the project's own number; it is how a rebuild
-        // lands on a build number App Store Connect will accept.
+        // lands on a version and build number App Store Connect will accept.
         let buildNumber = buildNumberOverride ?? input.buildNumber
         let marketingVersion = marketingVersionOverride ?? input.marketingVersion
 
@@ -1826,6 +1851,9 @@ struct Pipeline {
         case passed
         /// App Store Connect already has this build number; rebuild as `next`.
         case buildNumberTaken(next: Int)
+        /// The marketing version is not above the last approved release
+        /// (90062 / 90186); rebuild with a higher one.
+        case versionTooLow(approved: String?)
         /// Something else, already in plain language.
         case failed(message: String)
     }
@@ -1841,7 +1869,31 @@ struct Pipeline {
         if let previous = Self.usedBuildNumber(in: result.output) {
             return .buildNumberTaken(next: previous + 1)
         }
+        if Self.versionTrainClosed(in: result.output) {
+            return .versionTooLow(approved: Self.approvedVersion(in: result.output))
+        }
         return .failed(message: Self.humanize(Self.reason(fromAltool: result.output) ?? "Validation failed."))
+    }
+
+    /// Whether altool refused the archive because its marketing version is not
+    /// above the last approved App Store release. Apple reports it as 90062
+    /// ("must contain a higher version than that of the previously approved
+    /// version") and often 90186 ("train … closed for new build submissions")
+    /// together.
+    private static func versionTrainClosed(in output: String) -> Bool {
+        output.contains("90062") || output.contains("90186")
+            || output.contains("previously approved version")
+            || output.contains("closed for new build submissions")
+    }
+
+    /// The approved version Apple named in the refusal:
+    /// "… previously approved version [1.0] …".
+    private static func approvedVersion(in output: String) -> String? {
+        guard let range = output.range(of: "previously approved version [") else { return nil }
+        let tail = output[range.upperBound...]
+        guard let close = tail.firstIndex(of: "]") else { return nil }
+        let version = String(tail[..<close]).trimmingCharacters(in: .whitespaces)
+        return version.isEmpty ? nil : version
     }
 
     /// The build number App Store Connect reports as already used, when that is
