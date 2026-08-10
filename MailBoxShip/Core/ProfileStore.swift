@@ -34,6 +34,21 @@ struct ShipProfile: Codable, Identifiable, Hashable {
     var marketingVersion: String = ""
     var buildNumber: String = ""
 
+    /// Which platform to ship when the project builds more than one.
+    ///
+    /// Stored as the raw `ShipPlatform` value, empty meaning "follow whatever
+    /// the project detects". A single scheme can build both a Mac and an iPhone
+    /// app under the same bundle id, and detection can only report one of them —
+    /// so without a saved choice the other platform can never be uploaded. Kept
+    /// per profile because it is a property of this app, not of the session.
+    var platformRaw: String = ""
+
+    /// The user's explicit platform choice, or nil to follow detection.
+    var platformOverride: ShipPlatform? {
+        get { ShipPlatform(rawValue: platformRaw) }
+        set { platformRaw = newValue?.rawValue ?? "" }
+    }
+
     /// Permit revoking the oldest certificate when Apple refuses a new one.
     ///
     /// Saved with the store rather than held in view state: it used to reset on
@@ -91,6 +106,7 @@ struct ShipProfile: Codable, Identifiable, Hashable {
         identityPath = str(.identityPath)
         marketingVersion = str(.marketingVersion)
         buildNumber = str(.buildNumber)
+        platformRaw = str(.platformRaw)
         lastUsed = (try? c.decodeIfPresent(Date.self, forKey: .lastUsed)) as? Date ?? Date()
         proxy = (try? c.decodeIfPresent(ProxyConfig.self, forKey: .proxy)) as? ProxyConfig
             ?? ProxyConfig()

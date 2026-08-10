@@ -309,6 +309,22 @@ struct AdvancedView: View {
                     .font(.system(size: 12, design: .monospaced))
             }
 
+            Row("Platform") {
+                Picker("", selection: platformBinding) {
+                    ForEach(ShipPlatform.allCases) { platform in
+                        Text(platform.displayName).tag(platform)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .disabled(runner.isRunning)
+                if store.current.platformOverride == nil {
+                    Pill(text: "detected", color: .secondary)
+                }
+                Spacer()
+            }
+
             if !detectionNote.isEmpty {
                 HStack(spacing: 5) {
                     Image(systemName: detectionWarning
@@ -1029,6 +1045,22 @@ struct AdvancedView: View {
         }
     }
 
+    /// The platform this run ships as: the user's explicit choice, else what the
+    /// project detected. A scheme building both a Mac and an iPhone app under one
+    /// bundle id detects as a single platform, so the override reaches the other.
+    private var selectedPlatform: ShipPlatform {
+        store.current.platformOverride ?? detected.platform
+    }
+
+    /// Writes the segmented picker's choice back to the profile as an explicit
+    /// override, so it persists and the other platform can be shipped next time.
+    private var platformBinding: Binding<ShipPlatform> {
+        Binding(
+            get: { selectedPlatform },
+            set: { store.binding(\.platformRaw).wrappedValue = $0.rawValue },
+        )
+    }
+
     private func start(upload: Bool) {
         let problems = store.problems()
         guard problems.isEmpty else {
@@ -1050,7 +1082,7 @@ struct AdvancedView: View {
             input: Pipeline.Input(
                 profile: store.current,
                 configuration: configuration,
-                platform: detected.platform,
+                platform: selectedPlatform,
                 entitlementsByBundleID: detected.entitlements,
             ),
             upload: upload,

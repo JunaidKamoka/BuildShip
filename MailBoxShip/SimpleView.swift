@@ -27,6 +27,19 @@ struct SimpleView: View {
     private var problems: [String] { store.problems() }
     private var ready: Bool { problems.isEmpty && !runner.isRunning }
 
+    /// The platform this run ships as: the user's explicit choice, else whatever
+    /// the project detected. What actually gets built and uploaded.
+    private var selectedPlatform: ShipPlatform { p.platformOverride ?? detected.platform }
+
+    /// Writes the segmented picker's choice back to the profile as an explicit
+    /// override, so it persists and the other platform can be shipped next time.
+    private var platformBinding: Binding<ShipPlatform> {
+        Binding(
+            get: { selectedPlatform },
+            set: { store.binding(\.platformRaw).wrappedValue = $0.rawValue },
+        )
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             topBar
@@ -200,6 +213,7 @@ struct SimpleView: View {
                 if !team.isEmpty { chip(icon: "person.2", text: "Team \(team)", good: true) }
             }
 
+            platformRow
             issuerRow
             if Deployment.proxyConfigured { proxyRow }
 
@@ -220,6 +234,30 @@ struct SimpleView: View {
             .fill(Color(nsColor: .controlBackgroundColor)))
         .overlay(RoundedRectangle(cornerRadius: Design.corner, style: .continuous)
             .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
+    }
+
+    /// Which platform to upload. Defaults to what the project detected, but a
+    /// scheme that builds both a Mac and an iPhone app under the same bundle id
+    /// can only be detected as one — so this lets the other be chosen and shipped.
+    private var platformRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: selectedPlatform.symbol).font(.system(size: 11))
+                .foregroundStyle(Design.accent)
+            Text("Upload as").font(.system(size: 11)).foregroundStyle(.secondary)
+            Picker("", selection: platformBinding) {
+                ForEach(ShipPlatform.allCases) { platform in
+                    Text(platform.displayName).tag(platform)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .fixedSize()
+            .disabled(runner.isRunning)
+            if p.platformOverride == nil {
+                Text("detected").font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
     }
 
     /// Only asks for the issuer when nothing could resolve it — a known key, a
@@ -480,7 +518,7 @@ struct SimpleView: View {
             input: Pipeline.Input(
                 profile: store.current,
                 configuration: .release,
-                platform: detected.platform,
+                platform: selectedPlatform,
                 entitlementsByBundleID: detected.entitlements,
             ),
             upload: upload,

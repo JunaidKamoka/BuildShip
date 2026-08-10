@@ -6,9 +6,27 @@ import Foundation
 /// app keys off this: the archive destination, the App Store profile type, the
 /// App ID platform, whether export produces a `.pkg` needing an installer
 /// certificate, and the `altool` platform on validate and upload.
-enum ShipPlatform: String, Sendable {
+enum ShipPlatform: String, Sendable, CaseIterable, Identifiable {
     case iOS
     case macOS
+
+    var id: String { rawValue }
+
+    /// How the platform is named in the UI — the picker label and any prose.
+    var displayName: String {
+        switch self {
+        case .iOS: "iOS"
+        case .macOS: "macOS"
+        }
+    }
+
+    /// The SF Symbol standing in for the platform beside its selector.
+    var symbol: String {
+        switch self {
+        case .iOS: "iphone"
+        case .macOS: "desktopcomputer"
+        }
+    }
 }
 
 /// Reads a project and reports what is actually in it.
