@@ -408,31 +408,37 @@ final class ProfileStore: ObservableObject {
     }
 
     /// Fill in the Key ID from the conventional filename, saving one field.
+    ///
+    /// The filename wins over whatever is in the field, rather than only filling
+    /// a blank one. `AuthKey_<KeyID>.p8` states the key's identity outright, and
+    /// the common way to get here is swapping the key on an existing profile —
+    /// where leaving the previous Key ID in place silently pairs a new key with
+    /// the wrong id, and the run fails at authentication with nothing on screen
+    /// to explain it.
     func adoptKey(path: String) {
         guard let selectedIndex else { return }
         profiles[selectedIndex].keyPath = path
 
         let name = (path as NSString).lastPathComponent
-        if profiles[selectedIndex].keyID.isEmpty,
-           name.hasPrefix("AuthKey_"), name.hasSuffix(".p8") {
-            profiles[selectedIndex].keyID =
-                String(name.dropFirst("AuthKey_".count).dropLast(".p8".count))
+        guard name.hasPrefix("AuthKey_"), name.hasSuffix(".p8") else {
+            scheduleSave()
+            return
         }
+        let keyID = String(name.dropFirst("AuthKey_".count).dropLast(".p8".count))
+        profiles[selectedIndex].keyID = keyID
 
-        // If this key has been used before, its Issuer ID is already known —
-        // the filename gives the Key ID, and the pair is what identifies an
-        // account. This is what stopped the Issuer field being filled in.
-        // Failing a saved profile, the baked registry knows it: that is what
-        // lets a fresh machine resolve the issuer from the key filename alone.
-        if profiles[selectedIndex].issuerID.isEmpty {
-            let keyID = profiles[selectedIndex].keyID
-            if let match = profiles.first(where: {
-                $0.keyID == keyID && !$0.issuerID.isEmpty
-            }) {
-                profiles[selectedIndex].issuerID = match.issuerID
-            } else if let known = Deployment.issuer(forKeyID: keyID) {
-                profiles[selectedIndex].issuerID = known
-            }
+        // The Key ID and Issuer ID together identify an account, so a key the
+        // tool has seen before also settles the issuer — from a saved profile,
+        // or failing that the baked registry, which is what lets a fresh machine
+        // resolve the issuer from the key filename alone.
+        //
+        // An issuer already on screen is only replaced when the new key is
+        // known to belong to a different account. Several keys can share one
+        // issuer, so an unrecognised key is no reason to clear a correct value.
+        let known = profiles.first(where: { $0.keyID == keyID && !$0.issuerID.isEmpty })?.issuerID
+            ?? Deployment.issuer(forKeyID: keyID)
+        if let known {
+            profiles[selectedIndex].issuerID = known
         }
         scheduleSave()
     }

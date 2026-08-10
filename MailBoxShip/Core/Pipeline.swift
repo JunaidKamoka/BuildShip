@@ -166,6 +166,20 @@ struct Pipeline {
         /// macOS run.
         let installerCertificate: ASCClient.Certificate?
         let profiles: [String: String]
+        /// What the project itself reports — version, build, entitlements —
+        /// captured once during preflight so later decisions need not re-run
+        /// xcodebuild.
+        let projectInfo: ProjectInspector.Info
+        /// Embedded targets shipping under a different id than the project
+        /// gave them, because their original App ID belongs to another team.
+        /// Applied to the archive after it is built.
+        var bundleIDRenames: [String: String]
+        /// SHA-1 of the distribution identity inside the ephemeral keychain,
+        /// for signing bundles in the archive with the real certificate.
+        let signingIdentity: String?
+        /// The downloaded provisioning profile per bundle id, for embedding
+        /// into iOS bundles before export.
+        var profileFiles: [String: URL]
     }
 
     /// Build a signed .ipa and return its path.
@@ -197,7 +211,7 @@ struct Pipeline {
         }
 
         onStage(.account)
-        try await preflight()
+        let projectInfo = try await preflight()
 
         log("→ Resolving team from the API key…\n")
         let team = try await client.teamID()
@@ -215,31 +229,66 @@ struct Pipeline {
             ? try await prepareInstallerCertificate(client: client, keychain: keychain, team: team)
             : nil
 
-        let profiles = try await prepareProfiles(client: client, team: team, certificate: certificate)
+        var renames: [String: String] = [:]
+        var profileFiles: [String: URL] = [:]
+        let profiles = try await prepareProfiles(
+            client: client, team: team, certificate: certificate, renames: &renames,
+            profileFiles: &profileFiles)
 
         return BuildContext(
             client: client, team: team, certificate: certificate,
-            installerCertificate: installerCertificate, profiles: profiles)
+            installerCertificate: installerCertificate, profiles: profiles,
+            projectInfo: projectInfo, bundleIDRenames: renames,
+            signingIdentity: await Self.codesigningIdentityHash(inKeychainAt: keychain.path),
+            profileFiles: profileFiles)
+    }
+
+    /// The one codesigning identity the ephemeral keychain holds, by SHA-1 —
+    /// the only unambiguous way to hand codesign a specific certificate when
+    /// the login keychain may hold identities from other teams.
+    private static func codesigningIdentityHash(inKeychainAt path: String) async -> String? {
+        let result = await Shell.run(
+            "/usr/bin/security", ["find-identity", "-v", "-p", "codesigning", path])
+        guard let range = result.output.range(
+            of: "[0-9A-F]{40}", options: .regularExpression) else { return nil }
+        return String(result.output[range])
     }
 
     /// Archive and export a signed .ipa. Repeatable with a different build
     /// number without redoing the account setup in `prepare`.
     private func assemble(
         _ context: BuildContext, buildNumberOverride: String?,
+        marketingVersionOverride: String? = nil,
     ) async throws -> String {
         try prepareWorkspace()
-        try await archive(team: context.team, buildNumberOverride: buildNumberOverride)
-        // Stamp before signing: the stamp rewrites Info.plist, which would
-        // invalidate a signature already sealed over it.
+        try await archive(team: context.team, buildNumberOverride: buildNumberOverride,
+                          marketingVersionOverride: marketingVersionOverride)
+
+        // Stamp first, so the repaired metadata below records what ships.
         stampVersion(inArchiveAt: archivePath,
-                     buildNumber: buildNumberOverride ?? input.buildNumber)
-        try await embedEntitlements(inArchiveAt: archivePath, team: context.team)
+                     buildNumber: buildNumberOverride ?? input.buildNumber,
+                     marketingVersion: marketingVersionOverride ?? input.marketingVersion)
+        try repairArchive(team: context.team)
 
         // The archive is the first place a companion watch app becomes visible,
-        // so top up the profile map from what was actually built before signing.
+        // so top up the profile map from what was actually built — this is also
+        // where a foreign-team App ID surfaces and earns its rename.
+        var renames = context.bundleIDRenames
+        var profileFiles = context.profileFiles
+        var extraEntitlements: [String: String] = [:]
         let complete = try await coverEmbeddedProfiles(
             prepared: context.profiles, client: context.client,
-            team: context.team, certificate: context.certificate)
+            team: context.team, certificate: context.certificate, renames: &renames,
+            profileFiles: &profileFiles, extraEntitlements: &extraEntitlements)
+
+        // Plist edits stay ahead of signing: the renames rewrite Info.plist,
+        // which would invalidate a signature already sealed over it.
+        applyBundleIDRenames(inArchiveAt: archivePath, renames: renames)
+        try await embedEntitlements(inArchiveAt: archivePath, team: context.team,
+                                    renames: renames,
+                                    signingIdentity: context.signingIdentity,
+                                    profileFiles: profileFiles,
+                                    extraEntitlements: extraEntitlements)
 
         return try await export(profiles: complete, team: context.team)
     }
@@ -261,28 +310,20 @@ struct Pipeline {
         defer { Task { await keychain.destroy(log: log) } }
         let context = try await prepare(keychain: keychain)
 
-        // Ask App Store Connect what it already holds *before* archiving, and
-        // start above it. A clash found at validation has already cost a full
-        // build — and an explicitly configured number is exactly the case that
-        // needs checking, since it stays whatever it was until someone edits it,
-        // so it clashes on every ship after the first.
-        var buildOverride: String?
-        if let highest = await highestBuildNumber(client: context.client) {
-            let free = String(highest + 1)
-            if input.buildNumber.isEmpty {
-                buildOverride = free
-                log("→ App Store Connect already holds build \(highest); building \(free).\n")
-            } else if let requested = Int(input.buildNumber), requested <= highest {
-                buildOverride = free
-                log("→ Build \(input.buildNumber) is already used on App Store Connect; "
-                    + "building \(free) instead.\n")
-            }
-        }
+        // Ask Apple what the app already holds *before* archiving — every build
+        // number ever uploaded, and every App Store version with its state. A
+        // clash found at validation has already cost a full build; both answers
+        // are one API call each. Explicitly configured values are exactly the
+        // ones that need checking: they stay whatever they were until someone
+        // edits them, so they clash on every ship after the first.
+        let (buildStart, versionOverride) = await resolveAgainstAppStore(context: context)
+        var buildOverride = buildStart
 
         var rebuilds = 0
         let maxRebuilds = 5
         while true {
-            let ipa = try await assemble(context, buildNumberOverride: buildOverride)
+            let ipa = try await assemble(context, buildNumberOverride: buildOverride,
+                                         marketingVersionOverride: versionOverride)
 
             onStage(.validate)
             log("\n→ Validating before upload…\n")
@@ -317,12 +358,124 @@ struct Pipeline {
     /// app, or nil when there is nothing to go on — a brand-new app, or build
     /// numbers that are not plain integers — in which case the project's own
     /// number stands and any clash is caught and fixed after the fact.
-    private func highestBuildNumber(client: ASCClient) async -> Int? {
-        guard !input.bundleID.isEmpty,
-              let appID = try? await client.appID(bundleID: input.bundleID),
-              let builds = try? await client.builds(appID: appID)
+    /// What to actually ship as, given everything Apple already holds.
+    ///
+    /// Returns a build-number override and a marketing-version override, either
+    /// nil when the configured value is already safe. Decisions, in order:
+    ///
+    /// - No app record yet: a first upload, ship exactly as configured.
+    /// - Version's train already closed (released, in review, or otherwise not
+    ///   accepting builds): adopt the open version App Store Connect already
+    ///   has if one exists — that is the version the user created to ship next
+    ///   — otherwise bump the closed version's patch component.
+    /// - Build number at or below any build ever uploaded: highest + 1.
+    ///
+    /// When App Store Connect cannot answer the versions question, Apple's free
+    /// unauthenticated lookup supplies the released version as a fallback, so
+    /// the check degrades rather than disappears.
+    private func resolveAgainstAppStore(
+        context: BuildContext,
+    ) async -> (buildOverride: String?, versionOverride: String?) {
+        guard !input.bundleID.isEmpty else { return (nil, nil) }
+        let appID = try? await context.client.appID(bundleID: input.bundleID)
+
+        // The version whose train matters: the explicit field, else the
+        // project's own, read during preflight.
+        let effectiveVersion = input.marketingVersion.isEmpty
+            ? context.projectInfo.marketingVersion : input.marketingVersion
+
+        var versions: [(version: String, state: String)] = []
+        if let appID {
+            versions = (try? await context.client.appStoreVersionStrings(appID: appID)) ?? []
+        }
+        // Apple's public store lookup is an independent witness that needs no
+        // App Store Connect visibility at all — the app record can sit under a
+        // team this key cannot see, and the API can simply fail to answer.
+        // Merged rather than used as a fallback, so a live version is never
+        // missed just because ASC was only partially informative.
+        if let live = await liveVersionFromStoreLookup(),
+           !versions.contains(where: { $0.version == live }) {
+            versions.append((live, "READY_FOR_SALE"))
+        }
+
+        // States still accepting builds. Everything else — released, pending
+        // release, in review, processing — is a closed train.
+        let open: Set<String> = [
+            "PREPARE_FOR_SUBMISSION", "DEVELOPER_REJECTED", "REJECTED",
+            "METADATA_REJECTED", "INVALID_BINARY", "WAITING_FOR_REVIEW",
+        ]
+        let closedHighest = versions.filter { !open.contains($0.state) }.map(\.version)
+            .max(by: Self.versionOrdered)
+        let openHighest = versions.filter { open.contains($0.state) }.map(\.version)
+            .max(by: Self.versionOrdered)
+
+        var versionOverride: String?
+        if let closedHighest, !effectiveVersion.isEmpty,
+           !Self.versionOrdered(closedHighest, effectiveVersion) {
+            // The configured version is at or below a closed train.
+            if let openHighest, Self.versionOrdered(closedHighest, openHighest) {
+                versionOverride = openHighest
+            } else {
+                versionOverride = Self.bumpPatch(closedHighest)
+            }
+        }
+
+        var numbers: [Int] = []
+        if let appID { numbers = await context.client.allBuildNumbers(appID: appID) }
+        var buildOverride: String?
+        if let highest = numbers.max(),
+           input.buildNumber.isEmpty || (Int(input.buildNumber) ?? 0) <= highest {
+            buildOverride = String(highest + 1)
+        }
+
+        var findings: [String] = []
+        if let closedHighest { findings.append("latest released \(closedHighest)") }
+        if let openHighest { findings.append("open \(openHighest)") }
+        if let highest = numbers.max() { findings.append("highest build \(highest)") }
+        let state = findings.isEmpty
+            ? (appID == nil ? "no app record and nothing live — first upload" : "no versions or builds yet")
+            : findings.joined(separator: ", ")
+        let shipVersion = versionOverride ?? (effectiveVersion.isEmpty ? "project version" : effectiveVersion)
+        let shipBuild = buildOverride ?? (input.buildNumber.isEmpty ? "project build" : input.buildNumber)
+        log("→ App Store Connect: \(state) → shipping \(shipVersion) (\(shipBuild))\n")
+
+        return (buildOverride, versionOverride)
+    }
+
+    /// The version live on the App Store, from Apple's free unauthenticated
+    /// lookup — the fallback witness when the App Store Connect call fails.
+    private func liveVersionFromStoreLookup() async -> String? {
+        guard let url = URL(string:
+            "https://itunes.apple.com/lookup?bundleId=\(input.bundleID)&country=us")
         else { return nil }
-        return builds.compactMap { Int($0.version) }.max()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.connectionProxyDictionary = input.proxyDictionary
+        guard let (data, _) = try? await URLSession(configuration: configuration).data(from: url),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let first = (json["results"] as? [[String: Any]])?.first
+        else { return nil }
+        return first["version"] as? String
+    }
+
+    /// Numeric, component-wise "strictly before": 1.0.9 before 1.0.10, and
+    /// 1.0 equal to 1.0.0 (so not before it).
+    private static func versionOrdered(_ a: String, _ b: String) -> Bool {
+        let left = a.split(separator: ".").map { Int($0) ?? 0 }
+        let right = b.split(separator: ".").map { Int($0) ?? 0 }
+        for index in 0..<max(left.count, right.count) {
+            let l = index < left.count ? left[index] : 0
+            let r = index < right.count ? right[index] : 0
+            if l != r { return l < r }
+        }
+        return false
+    }
+
+    /// The next patch release after a version: 1.0.0 → 1.0.1, 2.1 → 2.1.1.
+    private static func bumpPatch(_ version: String) -> String {
+        var parts = version.split(separator: ".").map { Int($0) ?? 0 }
+        while parts.count < 3 { parts.append(0) }
+        parts[parts.count - 1] += 1
+        return parts.map(String.init).joined(separator: ".")
     }
 
     // MARK: - Preflight
@@ -341,7 +494,7 @@ struct Pipeline {
     /// The identifiers are stored per app profile while the project path is
     /// editable, so the two drift apart simply by pointing an existing profile
     /// at a different project.
-    private func preflight() async throws {
+    private func preflight() async throws -> ProjectInspector.Info {
         log("→ Checking the project against this app…\n")
         let info = await ProjectInspector.inspect(
             projectPath: input.projectPath, scheme: input.scheme)
@@ -350,7 +503,7 @@ struct Pipeline {
         // report the real problem rather than blocking on a guess.
         guard !info.bundleID.isEmpty else {
             log("  Could not read the project's identifiers; continuing\n")
-            return
+            return info
         }
 
         guard info.bundleID == input.bundleID else {
@@ -375,6 +528,7 @@ struct Pipeline {
             confirmed += " + " + info.extensionBundleIDs.joined(separator: ", ")
         }
         log(confirmed + " ✓\n")
+        return info
     }
 
     // MARK: - Signing assets
@@ -684,6 +838,7 @@ struct Pipeline {
 
     private func prepareProfiles(
         client: ASCClient, team: String, certificate: ASCClient.Certificate,
+        renames: inout [String: String], profileFiles: inout [String: URL],
     ) async throws -> [String: String] {
         onStage(.profiles)
         log("→ Preparing provisioning profiles…\n")
@@ -693,26 +848,79 @@ struct Pipeline {
 
         var mapping: [String: String] = [:]
         for identifier in [input.bundleID] + input.extensionBundleIDs {
-            mapping[identifier] = try await prepareProfile(
+            let prepared = try await prepareProfile(
                 for: identifier, client: client, team: team, certificate: certificate,
                 profileDir: profileDir,
-                entitlementsPath: input.entitlementsPath(for: identifier))
+                entitlementsPath: input.entitlementsPath(for: identifier),
+                renames: &renames)
+            mapping[prepared.identifier] = prepared.profileName
+            if let file = prepared.profileFile { profileFiles[prepared.identifier] = file }
         }
         return mapping
     }
 
+    /// The App ID this team can actually ship a bundle under.
+    ///
+    /// Normally the identifier itself. When that id is registered to a
+    /// *different* team, Apple will never allow this key to use it — but an
+    /// embedded target (a watch app, an extension) is free to ship under any id
+    /// prefixed by its host, so it is renamed to a deterministic, team-owned
+    /// variant instead of failing the run. Deterministic, so every rebuild and
+    /// every future ship of this app resolves to the same id and reuses the
+    /// same App ID and profiles. Only the host app cannot be renamed: its id
+    /// *is* the app's identity on the store.
+    private func registeredBundleID(
+        for identifier: String, client: ASCClient, team: String,
+        renames: inout [String: String],
+    ) async throws -> (identifier: String, resource: String) {
+        func register(_ id: String) async throws -> String {
+            try await client.bundleID(
+                identifier: id,
+                name: id.replacingOccurrences(of: ".", with: " "),
+                seedID: team,
+                platform: input.platform.bundleIDPlatform,
+            )
+        }
+
+        do {
+            return (identifier, try await register(identifier))
+        } catch let foreign as ASCClient.ForeignTeamBundleID {
+            guard identifier != input.bundleID else {
+                throw ShipError(
+                    "The App ID \(foreign.identifier) already exists on Apple's side under a "
+                    + "different team, and it is this app's own identifier, so it cannot be "
+                    + "renamed. Ship with the key for the team that owns it, or change the "
+                    + "app's bundle id in the project.")
+            }
+            // A suffix on the existing segment, not a new segment: Apple
+            // rejects an extension id with more than one period after its
+            // containing app's id (90347).
+            let renamed = "\(identifier)-t\(team.lowercased())"
+            do {
+                let resource = try await register(renamed)
+                log("  ⚠︎ \(identifier) belongs to another team — shipping it as \(renamed)\n")
+                renames[identifier] = renamed
+                return (renamed, resource)
+            } catch is ASCClient.ForeignTeamBundleID {
+                throw ShipError(
+                    "\(identifier) belongs to another team, and so does the fallback "
+                    + "\(renamed). Rename the target's bundle id in the project.")
+            }
+        }
+    }
+
     /// Create an App ID (if needed) and a fresh provisioning profile for one
     /// bundle id, and drop the profile where `xcodebuild` looks for it.
+    ///
+    /// The identifier actually provisioned is returned — it differs from the
+    /// one asked for when the App ID had to be renamed onto this team.
     private func prepareProfile(
-        for identifier: String, client: ASCClient, team: String,
+        for requested: String, client: ASCClient, team: String,
         certificate: ASCClient.Certificate, profileDir: URL, entitlementsPath: String,
-    ) async throws -> String {
-        let resource = try await client.bundleID(
-            identifier: identifier,
-            name: identifier.replacingOccurrences(of: ".", with: " "),
-            seedID: team,
-            platform: input.platform.bundleIDPlatform,
-        )
+        renames: inout [String: String],
+    ) async throws -> (identifier: String, profileName: String, profileFile: URL?) {
+        let (identifier, resource) = try await registeredBundleID(
+            for: requested, client: client, team: team, renames: &renames)
 
         // Turn on whatever this target's entitlements imply, before the profile
         // is issued — a profile inherits capabilities at creation, so enabling
@@ -742,11 +950,14 @@ struct Pipeline {
             certificateID: certificate.id,
         )
 
+        var file: URL?
         if let data = Data(base64Encoded: profile.content) {
-            try data.write(to: profileDir.appendingPathComponent("\(profile.uuid).mobileprovision"))
+            let destination = profileDir.appendingPathComponent("\(profile.uuid).mobileprovision")
+            try data.write(to: destination)
+            file = destination
         }
         log("  \(identifier) → \(profile.uuid)\n")
-        return profile.name
+        return (identifier, profile.name, file)
     }
 
     /// Ensure every bundle the archive actually embeds has a profile, creating
@@ -759,12 +970,97 @@ struct Pipeline {
     /// it without one, and Apple rejects the upload as 90174. Reading the bundle
     /// ids straight out of the finished archive is the one source that cannot
     /// miss them: whatever is in there is exactly what must be signed.
+    /// Make the archive the single-app form Xcode's export understands.
+    ///
+    /// A scheme that archives a second installable product — a watch app whose
+    /// target leaves SKIP_INSTALL unset is the classic case — puts *two* apps
+    /// under Products/Applications. Xcode then cannot tell which one is "the"
+    /// application, writes the archive's Info.plist without any
+    /// ApplicationProperties, and the archive is generic: export offers no
+    /// distribution methods for it and dies on `expected one {}` before even
+    /// reading the options. The stray product is exactly that — a copy already
+    /// embedded inside the host — so it is removed, and the missing
+    /// ApplicationProperties is written the way Xcode would have written it.
+    private func repairArchive(team: String) throws {
+        let fm = FileManager.default
+        let root = (archivePath as NSString).appendingPathComponent("Products/Applications")
+        let apps = ((try? fm.contentsOfDirectory(atPath: root)) ?? [])
+            .filter { $0.hasSuffix(".app") }.sorted()
+
+        func identifier(ofAppNamed name: String) -> String? {
+            let base = (root as NSString).appendingPathComponent(name)
+            for plist in [base + "/Info.plist", base + "/Contents/Info.plist"]
+            where fm.fileExists(atPath: plist) {
+                return bundleIdentifier(atPlist: plist)
+            }
+            return nil
+        }
+
+        guard let host = apps.first(where: { identifier(ofAppNamed: $0) == input.bundleID })
+            ?? (apps.count == 1 ? apps.first : nil)
+        else {
+            throw ShipError("The archive holds \(apps.count) apps and none of them is "
+                + "\(input.bundleID). The scheme is archiving the wrong products.")
+        }
+        let hostPath = (root as NSString).appendingPathComponent(host)
+
+        for stray in apps where stray != host {
+            let strayID = identifier(ofAppNamed: stray)
+            let embeddedInHost = bundleRootInfoPlists(inArchiveAt: archivePath).contains {
+                $0.hasPrefix(hostPath + "/") && bundleIdentifier(atPlist: $0) == strayID
+            }
+            guard embeddedInHost else {
+                throw ShipError("The scheme archives a second app, \(stray), that is not "
+                    + "embedded in \(host). Ship it from its own scheme, or set "
+                    + "SKIP_INSTALL=YES on its target.")
+            }
+            try? fm.removeItem(atPath: (root as NSString).appendingPathComponent(stray))
+            log("  Removed stray top-level \(stray) — the copy embedded in \(host) ships\n")
+        }
+
+        let infoPath = (archivePath as NSString).appendingPathComponent("Info.plist")
+        var format = PropertyListSerialization.PropertyListFormat.xml
+        guard let data = fm.contents(atPath: infoPath),
+              var info = try? PropertyListSerialization.propertyList(
+                  from: data, format: &format) as? [String: Any],
+              info["ApplicationProperties"] == nil
+        else { return }
+
+        var properties: [String: Any] = [
+            "ApplicationPath": "Applications/\(host)",
+            "Architectures": ["arm64"],
+            "Team": team,
+        ]
+        let hostPlist = fm.fileExists(atPath: hostPath + "/Contents/Info.plist")
+            ? hostPath + "/Contents/Info.plist" : hostPath + "/Info.plist"
+        if let plistData = fm.contents(atPath: hostPlist),
+           let plist = try? PropertyListSerialization.propertyList(
+               from: plistData, format: nil) as? [String: Any] {
+            properties["CFBundleIdentifier"] = plist["CFBundleIdentifier"] ?? input.bundleID
+            if let version = plist["CFBundleShortVersionString"] {
+                properties["CFBundleShortVersionString"] = version
+            }
+            if let build = plist["CFBundleVersion"] { properties["CFBundleVersion"] = build }
+        }
+        info["ApplicationProperties"] = properties
+        if let updated = try? PropertyListSerialization.data(
+            fromPropertyList: info, format: format, options: 0) {
+            try? updated.write(to: URL(fileURLWithPath: infoPath))
+            log("  Restored the archive's application metadata — the stray product had "
+                + "made it generic\n")
+        }
+    }
+
     private func coverEmbeddedProfiles(
         prepared: [String: String], client: ASCClient, team: String,
-        certificate: ASCClient.Certificate,
+        certificate: ASCClient.Certificate, renames: inout [String: String],
+        profileFiles: inout [String: URL], extraEntitlements: inout [String: String],
     ) async throws -> [String: String] {
         let embedded = embeddedBundleIDs(inArchiveAt: archivePath)
-        let missing = embedded.filter { prepared[$0] == nil }.sorted()
+        // A bundle already renamed is covered under its new id.
+        let missing = embedded
+            .filter { prepared[renames[$0] ?? $0] == nil }
+            .sorted()
         guard !missing.isEmpty else { return prepared }
 
         log("→ Covering embedded targets the scheme did not surface: "
@@ -775,19 +1071,68 @@ struct Pipeline {
         // capability its code relies on (App Groups, say) is silently dropped.
         let entitlements = await ProjectInspector.entitlementsAcrossSchemes(
             projectPath: input.projectPath)
+        // These are also what embedding needs later: a watch app's entitlements
+        // are invisible to the main scheme, so without this they would never
+        // be signed into the bundle.
+        for (identifier, path) in entitlements
+        where extraEntitlements[identifier] == nil
+            && input.entitlementsPath(for: identifier).isEmpty {
+            extraEntitlements[identifier] = path
+        }
 
         let profileDir = profileDirectory
         try FileManager.default.createDirectory(at: profileDir, withIntermediateDirectories: true)
 
         var mapping = prepared
         for identifier in missing {
-            mapping[identifier] = try await prepareProfile(
+            let prepared = try await prepareProfile(
                 for: identifier, client: client, team: team, certificate: certificate,
                 profileDir: profileDir,
                 entitlementsPath: entitlements[identifier]
-                    ?? input.entitlementsPath(for: identifier))
+                    ?? input.entitlementsPath(for: identifier),
+                renames: &renames)
+            mapping[prepared.identifier] = prepared.profileName
+            if let file = prepared.profileFile { profileFiles[prepared.identifier] = file }
         }
         return mapping
+    }
+
+    /// Rewrite the archive so every renamed bundle actually carries its new id.
+    ///
+    /// Two kinds of edit: each renamed bundle's own `CFBundleIdentifier`, and
+    /// every *reference* to an old id from any other bundle — a watch app names
+    /// its phone app in `WKCompanionAppBundleIdentifier`, an extension names its
+    /// watch app in `WKAppBundleIdentifier`, and missing one leaves the pair
+    /// pointing at an id that no longer exists in the archive. Values are
+    /// rewritten wherever they appear in each plist rather than at known keys,
+    /// so the next container relationship Apple invents is covered too.
+    private func applyBundleIDRenames(inArchiveAt archive: String, renames: [String: String]) {
+        guard !renames.isEmpty else { return }
+
+        func rewrite(_ value: Any) -> Any {
+            if let string = value as? String { return renames[string] ?? string }
+            if let array = value as? [Any] { return array.map(rewrite) }
+            if let dictionary = value as? [String: Any] {
+                return dictionary.mapValues(rewrite)
+            }
+            return value
+        }
+
+        for path in bundleRootInfoPlists(inArchiveAt: archive) {
+            var format = PropertyListSerialization.PropertyListFormat.xml
+            guard let data = FileManager.default.contents(atPath: path),
+                  let plist = try? PropertyListSerialization.propertyList(
+                      from: data, format: &format) as? [String: Any]
+            else { continue }
+            let rewritten = rewrite(plist)
+            if let updated = try? PropertyListSerialization.data(
+                fromPropertyList: rewritten, format: format, options: 0) {
+                try? updated.write(to: URL(fileURLWithPath: path))
+            }
+        }
+        for (old, new) in renames.sorted(by: { $0.key < $1.key }) {
+            log("  Shipping \(old) as \(new)\n")
+        }
     }
 
     /// The Info.plist at the root of every bundle inside the archive's app: the
@@ -847,19 +1192,65 @@ struct Pipeline {
     /// finds. Archiving ad-hoc instead would be simpler, but Xcode refuses:
     /// a target declaring entitlements demands a provisioning profile at build
     /// time, which is exactly what signing at export exists to avoid.
-    private func embedEntitlements(inArchiveAt archive: String, team: String) async throws {
-        // Deepest first: codesign requires a nested bundle to be signed before
-        // the bundle that contains it.
+    private func embedEntitlements(
+        inArchiveAt archive: String, team: String, renames: [String: String] = [:],
+        signingIdentity: String? = nil, profileFiles: [String: URL] = [:],
+        extraEntitlements: [String: String] = [:],
+    ) async throws {
+        // macOS keeps the ad-hoc carrier — export re-signs over it and the
+        // path is proven through validation and upload. iOS cannot: Xcode
+        // derives an iOS archive's *eligible distribution methods* from the
+        // signature it finds on the app, and ad-hoc yields none at all —
+        // export then dies on `expected one {}` before reading any options.
+        // So iOS bundles carry the real distribution identity and their
+        // provisioning profile, making the archive look exactly like one
+        // Xcode signed itself.
+        let identity = input.platform == .iOS ? (signingIdentity ?? "-") : "-"
         // Deepest first, so a bundle is always signed after everything it
         // contains — codesign will not seal a bundle around unsigned code.
         let bundles = archivedBundles(inArchiveAt: archive)
             .sorted { $0.bundle.count > $1.bundle.count }
 
+        // A renamed bundle's plist now carries the new id, but the project's
+        // entitlements are still filed under the original.
+        let originalByRenamed = Dictionary(
+            renames.map { ($0.value, $0.key) }, uniquingKeysWith: { first, _ in first })
+
         var declared: [(path: String, id: String, file: URL, keys: Set<String>)] = []
         for (path, plist) in bundles {
-            guard let identifier = bundleIdentifier(atPlist: plist),
-                  let resolved = try await resolvedEntitlements(for: identifier, team: team)
+            guard let identifier = bundleIdentifier(atPlist: plist) else { continue }
+            let declaredAs = originalByRenamed[identifier] ?? identifier
+            guard var resolved = try await resolvedEntitlements(
+                for: declaredAs, signedAs: identifier, team: team,
+                sourceOverride: extraEntitlements[declaredAs])
             else { continue }
+
+            // On iOS, a bundle can only be signed with entitlements its
+            // provisioning profile carries — export refuses anything more
+            // ("doesn't support the X App Group"). And the profile can carry
+            // no more than the API can put on the App ID: app groups in
+            // particular are assignable only in the developer portal. So keys
+            // the profile does not support are dropped, loudly — shipping
+            // without them is exactly what every build before entitlement
+            // embedding shipped, and the warning names the manual fix.
+            // macOS is exempt: its App Store profiles never list the sandbox
+            // keys, and its export accepts the full declared set.
+            if input.platform == .iOS, let profile = profileFiles[identifier] {
+                let allowed = await Self.profileEntitlements(at: profile)
+                let unsupported = Self.entitlementKeysUnsupported(
+                    byProfile: allowed, atEntitlementsFile: resolved.file)
+                if !allowed.isEmpty, !unsupported.isEmpty {
+                    resolved = try Self.removingKeys(
+                        unsupported, fromEntitlementsAt: resolved.file)
+                    for key in unsupported.sorted() {
+                        log("  ⚠︎ \(identifier): dropped \(key) — its provisioning "
+                            + "profile cannot sign that value. Assign the capability's "
+                            + "details (the app group, say) to the App ID in the "
+                            + "developer portal to restore it.\n")
+                    }
+                }
+            }
+            guard !resolved.keys.isEmpty else { continue }
             declared.append((path, identifier, resolved.file, resolved.keys))
         }
 
@@ -871,7 +1262,8 @@ struct Pipeline {
         // actually matters, sealing the bundle around it fails next and that
         // *is* fatal, with a better message than this loop could give.
         for nested in nestedCode(inArchiveAt: archive).sorted(by: { $0.count > $1.count }) {
-            let result = await Shell.run("/usr/bin/codesign", ["--force", "--sign", "-", nested])
+            let result = await Shell.run(
+                "/usr/bin/codesign", ["--force", "--sign", identity, nested])
             if !result.succeeded {
                 log("  ⚠︎ Could not sign \((nested as NSString).lastPathComponent)\n")
             }
@@ -882,8 +1274,21 @@ struct Pipeline {
         // has to be signed, or the bundle containing it cannot be sealed.
         let entitlementsByPath = Dictionary(
             declared.map { ($0.path, $0.file) }, uniquingKeysWith: { first, _ in first })
-        for (path, _) in bundles {
-            var arguments = ["--force", "--sign", "-"]
+        for (path, plist) in bundles {
+            // The profile the bundle will ship with, in the place Xcode puts
+            // it. Keyed by the id actually being shipped — after a rename that
+            // is the new one, which is what the plist now carries.
+            if input.platform == .iOS,
+               let identifier = bundleIdentifier(atPlist: plist),
+               let profile = profileFiles[identifier] {
+                let embedded = (path as NSString)
+                    .appendingPathComponent("embedded.mobileprovision")
+                try? FileManager.default.removeItem(atPath: embedded)
+                try? FileManager.default.copyItem(
+                    atPath: profile.path, toPath: embedded)
+            }
+
+            var arguments = ["--force", "--sign", identity]
             if let file = entitlementsByPath[path] {
                 arguments += ["--entitlements", file.path]
             }
@@ -910,6 +1315,77 @@ struct Pipeline {
             log("  Entitlements embedded for \(target.id) "
                 + "(\(target.keys.count) key\(target.keys.count == 1 ? "" : "s"))\n")
         }
+    }
+
+    /// The entitlements a provisioning profile is able to sign, values and all.
+    ///
+    /// Decoded to a file, not parsed from process output — the shell merges
+    /// stdout and stderr, and any diagnostic line would corrupt the plist.
+    private static func profileEntitlements(at file: URL) async -> [String: Any] {
+        let decoded = file.deletingPathExtension().appendingPathExtension("decoded.plist")
+        defer { try? FileManager.default.removeItem(at: decoded) }
+        let result = await Shell.run(
+            "/usr/bin/security", ["cms", "-D", "-i", file.path, "-o", decoded.path])
+        guard result.succeeded,
+              let data = FileManager.default.contents(atPath: decoded.path),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, format: nil) as? [String: Any],
+              let entitlements = plist["Entitlements"] as? [String: Any]
+        else { return [:] }
+        return entitlements
+    }
+
+    /// The declared entitlement keys this profile cannot sign.
+    ///
+    /// Presence of the key is not enough: a profile whose App ID has the App
+    /// Groups capability but no groups assigned carries
+    /// `com.apple.security.application-groups = ()` — the key exists, allows
+    /// nothing, and export rejects any declared group against it. So list
+    /// values are checked for coverage, item by item, honouring the `TEAM.*`
+    /// wildcards profiles use for keychain groups.
+    private static func entitlementKeysUnsupported(
+        byProfile allowed: [String: Any], atEntitlementsFile file: URL,
+    ) -> Set<String> {
+        guard !allowed.isEmpty,
+              let data = FileManager.default.contents(atPath: file.path),
+              let declared = try? PropertyListSerialization.propertyList(
+                  from: data, format: nil) as? [String: Any]
+        else { return [] }
+
+        var unsupported = Set<String>()
+        for (key, value) in declared {
+            guard let allowedValue = allowed[key] else {
+                unsupported.insert(key)
+                continue
+            }
+            guard let wanted = value as? [String] else { continue }
+            let patterns = allowedValue as? [String] ?? []
+            let covered = wanted.allSatisfy { want in
+                patterns.contains { pattern in
+                    pattern == want
+                        || (pattern.hasSuffix("*")
+                            && want.hasPrefix(String(pattern.dropLast())))
+                }
+            }
+            if !covered { unsupported.insert(key) }
+        }
+        return unsupported
+    }
+
+    /// Rewrite an entitlements file without the given keys.
+    private static func removingKeys(
+        _ keys: Set<String>, fromEntitlementsAt file: URL,
+    ) throws -> (file: URL, keys: Set<String>) {
+        var format = PropertyListSerialization.PropertyListFormat.xml
+        guard let data = FileManager.default.contents(atPath: file.path),
+              var plist = try? PropertyListSerialization.propertyList(
+                  from: data, format: &format) as? [String: Any]
+        else { throw ShipError("Could not re-read staged entitlements at \(file.path)") }
+        for key in keys { plist.removeValue(forKey: key) }
+        let updated = try PropertyListSerialization.data(
+            fromPropertyList: plist, format: format, options: 0)
+        try updated.write(to: file)
+        return (file, Set(plist.keys))
     }
 
     /// What a signed bundle actually carries, read back from its signature.
@@ -961,10 +1437,16 @@ struct Pipeline {
     /// runtime, where a keychain group reading `$(AppIdentifierPrefix)com.x.y`
     /// simply never matches.
     private func resolvedEntitlements(
-        for identifier: String, team: String,
+        for identifier: String, signedAs: String? = nil, team: String,
+        sourceOverride: String? = nil,
     ) async throws -> (file: URL, keys: Set<String>)? {
+        // The id embedded in expanded variables is the one the bundle is
+        // *signed* as — after a rename that differs from the id the project
+        // declared the entitlements under.
+        let signedIdentifier = signedAs ?? identifier
         // No entitlements declared is normal and not a problem.
-        let source = input.entitlementsPath(for: identifier)
+        var source = input.entitlementsPath(for: identifier)
+        if source.isEmpty { source = sourceOverride ?? "" }
         guard !source.isEmpty else { return nil }
 
         // Declared but unreadable is a problem, and a silent skip here is how an
@@ -978,8 +1460,8 @@ struct Pipeline {
             .replacingOccurrences(of: "$(AppIdentifierPrefix)", with: "\(team).")
             .replacingOccurrences(of: "$(TeamIdentifierPrefix)", with: "\(team).")
             .replacingOccurrences(of: "$(DEVELOPMENT_TEAM)", with: team)
-            .replacingOccurrences(of: "$(CFBundleIdentifier)", with: identifier)
-            .replacingOccurrences(of: "$(PRODUCT_BUNDLE_IDENTIFIER)", with: identifier)
+            .replacingOccurrences(of: "$(CFBundleIdentifier)", with: signedIdentifier)
+            .replacingOccurrences(of: "$(PRODUCT_BUNDLE_IDENTIFIER)", with: signedIdentifier)
 
         // What is left is a setting the project defines itself, like a
         // `$(BASE_PACKAGE_IDENTIFIER)` shared between an app and its extensions.
@@ -1074,8 +1556,10 @@ struct Pipeline {
     /// Safe because the archive is built unsigned and export signs it
     /// afterwards. Extensions are stamped too — Apple rejects an upload whose
     /// extension build number differs from its host app's.
-    private func stampVersion(inArchiveAt archive: String, buildNumber: String) {
-        guard !buildNumber.isEmpty || !input.marketingVersion.isEmpty else { return }
+    private func stampVersion(
+        inArchiveAt archive: String, buildNumber: String, marketingVersion: String,
+    ) {
+        guard !buildNumber.isEmpty || !marketingVersion.isEmpty else { return }
 
         for path in bundleRootInfoPlists(inArchiveAt: archive) {
             var format = PropertyListSerialization.PropertyListFormat.xml
@@ -1085,8 +1569,8 @@ struct Pipeline {
             else { continue }
 
             if !buildNumber.isEmpty { plist["CFBundleVersion"] = buildNumber }
-            if !input.marketingVersion.isEmpty {
-                plist["CFBundleShortVersionString"] = input.marketingVersion
+            if !marketingVersion.isEmpty {
+                plist["CFBundleShortVersionString"] = marketingVersion
             }
             if let updated = try? PropertyListSerialization.data(
                 fromPropertyList: plist, format: format, options: 0) {
@@ -1108,13 +1592,17 @@ struct Pipeline {
         work.appendingPathComponent("build/App.xcarchive").path
     }
 
-    private func archive(team: String, buildNumberOverride: String? = nil) async throws {
+    private func archive(
+        team: String, buildNumberOverride: String? = nil,
+        marketingVersionOverride: String? = nil,
+    ) async throws {
         onStage(.archive)
         log("\n→ Archiving (\(input.configuration.rawValue))… this takes a few minutes\n")
 
         // An override wins over the project's own number; it is how a rebuild
         // lands on a build number App Store Connect will accept.
         let buildNumber = buildNumberOverride ?? input.buildNumber
+        let marketingVersion = marketingVersionOverride ?? input.marketingVersion
 
         var args = ProjectInspector.container(forProjectPath: input.projectPath).arguments + [
             "-scheme", input.scheme,
@@ -1142,7 +1630,7 @@ struct Pipeline {
             "CODE_SIGN_IDENTITY=",
             "CODE_SIGN_STYLE=Manual",
         ]
-        if !input.marketingVersion.isEmpty { args.append("MARKETING_VERSION=\(input.marketingVersion)") }
+        if !marketingVersion.isEmpty { args.append("MARKETING_VERSION=\(marketingVersion)") }
         if !buildNumber.isEmpty { args.append("CURRENT_PROJECT_VERSION=\(buildNumber)") }
         args.append("archive")
 

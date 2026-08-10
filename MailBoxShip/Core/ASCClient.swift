@@ -196,12 +196,40 @@ struct ASCClient {
             // It exists after all — either the filter missed it or another
             // process registered it in between. Find it rather than failing.
             if let existing = try await findBundleID(identifier, force: true) { return existing }
-            throw ShipError(
-                "The App ID \(identifier) already exists on Apple's side but a full search of "
-                + "this key's team did not find it, so the key cannot use it — most likely it "
-                + "belongs to a different team. Register \(identifier) under this team, or ship "
-                + "with the key for the team that already owns it."
-            )
+            // Registered globally, invisible to this team: it belongs to a
+            // different team. Typed, because the caller can sometimes resolve
+            // this on its own — an embedded target can ship under a renamed id,
+            // only the host app's identity is immovable.
+            throw ForeignTeamBundleID(identifier: identifier)
+        }
+    }
+
+    /// An App ID that exists on Apple's side but under some other team, so this
+    /// key can neither use nor register it.
+    struct ForeignTeamBundleID: Error {
+        let identifier: String
+    }
+
+    /// Every build number ever uploaded for an app, following the cursor to the
+    /// end — the first page holds the *newest* uploads, and the highest number
+    /// is not necessarily among them.
+    func allBuildNumbers(appID: String) async -> [Int] {
+        let items = (try? await requestAll("/v1/builds?filter[app]=\(appID)&limit=200")) ?? []
+        return items.compactMap {
+            Int(($0["attributes"] as? [String: Any])?["version"] as? String ?? "")
+        }
+    }
+
+    /// Every App Store version of an app with its state — what decides whether
+    /// a version string is still open for new builds or its train has closed.
+    func appStoreVersionStrings(appID: String) async throws -> [(version: String, state: String)] {
+        let items = try await requestAll("/v1/apps/\(appID)/appStoreVersions?limit=200")
+        return items.compactMap {
+            guard let attributes = $0["attributes"] as? [String: Any],
+                  let version = attributes["versionString"] as? String
+            else { return nil }
+            return (version, attributes["appStoreState"] as? String
+                    ?? attributes["appVersionState"] as? String ?? "")
         }
     }
 
