@@ -66,7 +66,10 @@ enum CLI {
                 projectPath: profile.projectPath,
                 scheme: scheme,
                 configuration: .release,
-                platform: detected.platform,
+                // The CLI always reads the project first, so detection is the
+                // authority here; the saved choice only covers a project that
+                // could not be read at all.
+                platform: detected.platform ?? profile.detectedPlatform ?? profile.platformOverride ?? .iOS,
                 bundleID: profile.bundleID,
                 extensionBundleIDs: profile.extensionBundleIDs,
                 keyPath: profile.keyPath,

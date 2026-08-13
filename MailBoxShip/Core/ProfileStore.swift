@@ -49,6 +49,31 @@ struct ShipProfile: Codable, Identifiable, Hashable {
         set { platformRaw = newValue?.rawValue ?? "" }
     }
 
+    /// What detection last read from this project, remembered across launches.
+    ///
+    /// Detection is a multi-second `xcodebuild` call, but every field it needs
+    /// to fill is already saved — so the Deploy button is live from the moment
+    /// the window opens, well before the project has been read. Without this,
+    /// the platform for that first run came from an in-memory default of iOS,
+    /// and pressing Deploy early archived a Mac app with
+    /// `-destination generic/platform=iOS`, which xcodebuild rejects with a
+    /// list of destinations and no hint as to why one was asked for.
+    var detectedPlatformRaw: String = ""
+
+    /// The last detected platform, or nil if this project has never been read.
+    var detectedPlatform: ShipPlatform? {
+        get { ShipPlatform(rawValue: detectedPlatformRaw) }
+        set { detectedPlatformRaw = newValue?.rawValue ?? "" }
+    }
+
+    /// The platform a run ships as, in order of authority: the user's explicit
+    /// choice, then what this session detected, then what the last session
+    /// detected. iOS only as the final resort, for a project nothing has yet
+    /// managed to read.
+    func shipPlatform(detected: ShipPlatform?) -> ShipPlatform {
+        platformOverride ?? detected ?? detectedPlatform ?? .iOS
+    }
+
     /// Permit revoking the oldest certificate when Apple refuses a new one.
     ///
     /// Saved with the store rather than held in view state: it used to reset on
@@ -107,6 +132,7 @@ struct ShipProfile: Codable, Identifiable, Hashable {
         marketingVersion = str(.marketingVersion)
         buildNumber = str(.buildNumber)
         platformRaw = str(.platformRaw)
+        detectedPlatformRaw = str(.detectedPlatformRaw)
         lastUsed = (try? c.decodeIfPresent(Date.self, forKey: .lastUsed)) as? Date ?? Date()
         proxy = (try? c.decodeIfPresent(ProxyConfig.self, forKey: .proxy)) as? ProxyConfig
             ?? ProxyConfig()
@@ -522,9 +548,17 @@ final class ProfileStore: ObservableObject {
         // for one just chosen — a leftover override silently stamps another
         // app's version and build onto this one, and a build number is spent
         // the moment it reaches Apple.
+        //
+        // The platform belongs to the app that was here before for the same
+        // reason: an iPhone app shipped from this profile leaves an explicit
+        // iOS choice behind, and a Mac project adopted afterwards is then
+        // pinned to iOS by a picker the user last touched for another app.
+        // Clearing both returns the profile to following detection.
         if replacesAnotherProject {
             profiles[selectedIndex].marketingVersion = ""
             profiles[selectedIndex].buildNumber = ""
+            profiles[selectedIndex].platformRaw = ""
+            profiles[selectedIndex].detectedPlatformRaw = ""
         }
         if profiles[selectedIndex].name == "New profile" {
             profiles[selectedIndex].name = uniqueName(base)

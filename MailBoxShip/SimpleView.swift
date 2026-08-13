@@ -21,15 +21,23 @@ struct SimpleView: View {
     @State private var team = ""
     @State private var copiedLog = false
     @State private var showSync = false
+    /// Checked once rather than per render — it is a handful of filesystem
+    /// probes, and a view body is not the place for them.
+    @State private var uploaderInstalled = true
 
     private var p: ShipProfile { store.current }
     private var bothChosen: Bool { !p.projectPath.isEmpty && !p.keyPath.isEmpty }
     private var problems: [String] { store.problems() }
-    private var ready: Bool { problems.isEmpty && !runner.isRunning }
+
+    /// Detection has to finish before a run can start. Every field `problems()`
+    /// checks is saved, so the button is otherwise live the instant the window
+    /// opens — and a run started there is built from whatever the *previous*
+    /// project left in state.
+    private var ready: Bool { problems.isEmpty && !runner.isRunning && !detecting }
 
     /// The platform this run ships as: the user's explicit choice, else whatever
     /// the project detected. What actually gets built and uploaded.
-    private var selectedPlatform: ShipPlatform { p.platformOverride ?? detected.platform }
+    private var selectedPlatform: ShipPlatform { p.shipPlatform(detected: detected.platform) }
 
     /// Writes the segmented picker's choice back to the profile as an explicit
     /// override, so it persists and the other platform can be shipped next time.
@@ -59,6 +67,7 @@ struct SimpleView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .task(id: store.selectedID) {
             store.applyBakedProxyIfNeeded()
+            uploaderInstalled = Transporter.isInstalled
             await detect()
             await fetchTeam()
         }
@@ -215,6 +224,7 @@ struct SimpleView: View {
 
             platformRow
             issuerRow
+            uploaderRow
             if Deployment.proxyConfigured { proxyRow }
 
             if !note.isEmpty {
@@ -257,6 +267,27 @@ struct SimpleView: View {
                 Text("detected").font(.system(size: 10)).foregroundStyle(.secondary)
             }
             Spacer()
+        }
+    }
+
+    /// Says up front when this Mac cannot upload at all.
+    ///
+    /// Xcode 26 dropped the uploader, so a Mac with Xcode alone can build and
+    /// sign perfectly and then fail at the last step. That is worth knowing
+    /// beside the other preconditions rather than after a five-minute build —
+    /// and it is a missing *app*, so nothing this tool does can resolve it.
+    @ViewBuilder private var uploaderRow: some View {
+        if !uploaderInstalled {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 11))
+                    .foregroundStyle(Design.warning)
+                Text("No uploader — install Apple's free Transporter to deploy.")
+                    .font(.system(size: 11)).foregroundStyle(Design.warning)
+                Link("Get it", destination: URL(
+                    string: "https://apps.apple.com/app/transporter/id1450874784")!)
+                    .font(.system(size: 11))
+                Spacer()
+            }
         }
     }
 
@@ -330,6 +361,11 @@ struct SimpleView: View {
 
                 if !ready, bothChosen, let first = problems.first {
                     Text(first).font(.system(size: 11)).foregroundStyle(Design.warning)
+                } else if detecting, !runner.isRunning {
+                    // Say why the button is inert, rather than leaving a ready
+                    // -looking screen with a dead button on it.
+                    Text("Reading the project…").font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -475,6 +511,12 @@ struct SimpleView: View {
         var info = await ProjectInspector.inspect(projectPath: path, scheme: scheme)
         info.schemes = schemes
         detected = info
+
+        // Remember the platform, so the next launch knows this is a Mac app
+        // before it has had time to read the project again.
+        if let platform = info.platform {
+            store.binding(\.detectedPlatformRaw).wrappedValue = platform.rawValue
+        }
 
         // The simple screen has no bundle-id field to reconcile, so it trusts
         // what the scheme actually builds and adopts it outright.

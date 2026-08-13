@@ -776,15 +776,19 @@ struct AdvancedView: View {
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
                         .fill(Color.primary.opacity(0.07)),
                 )
-                .disabled(runner.isRunning)
+                // Detection has to land first: it is what says which platform
+                // the scheme builds, and a run started before it reports is
+                // built from whatever was left in state.
+                .disabled(runner.isRunning || detecting)
 
                 PrimaryButton(
                     title: runner.isRunning ? "Working…" : "Build & Upload",
                     symbol: runner.isRunning ? "hourglass" : "arrow.up.circle.fill",
-                    enabled: !runner.isRunning && configuration == .release,
+                    enabled: !runner.isRunning && !detecting && configuration == .release,
                 ) { start(upload: true) }
                 .frame(width: 170)
-                .help(configuration == .release
+                .help(detecting ? "Reading the project…"
+                      : configuration == .release
                       ? "Archive, sign, validate and upload"
                       : "Only a Release build can be uploaded")
             }
@@ -915,6 +919,12 @@ struct AdvancedView: View {
         var info = await ProjectInspector.inspect(projectPath: path, scheme: scheme)
         info.schemes = schemes
         detected = info
+
+        // Remember the platform, so the next launch knows this is a Mac app
+        // before it has had time to read the project again.
+        if let platform = info.platform {
+            store.binding(\.detectedPlatformRaw).wrappedValue = platform.rawValue
+        }
 
         if adopting, !info.bundleID.isEmpty {
             // Replace, rather than fill. Guarded on having actually read
@@ -1049,7 +1059,7 @@ struct AdvancedView: View {
     /// project detected. A scheme building both a Mac and an iPhone app under one
     /// bundle id detects as a single platform, so the override reaches the other.
     private var selectedPlatform: ShipPlatform {
-        store.current.platformOverride ?? detected.platform
+        store.current.shipPlatform(detected: detected.platform)
     }
 
     /// Writes the segmented picker's choice back to the profile as an explicit

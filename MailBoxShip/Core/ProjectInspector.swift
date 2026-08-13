@@ -40,10 +40,13 @@ enum ProjectInspector {
 
     struct Info {
         var schemes: [String] = []
-        /// What the app target builds for. Drives the whole macOS-vs-iOS split
-        /// downstream; defaults to iOS, so a project that cannot be read keeps
-        /// the original behaviour.
-        var platform: ShipPlatform = .iOS
+        /// What the app target builds for, or nil when the project has not been
+        /// read yet. Drives the whole macOS-vs-iOS split downstream, which is
+        /// exactly why "not read yet" must not be spelled `.iOS`: a default that
+        /// names a real platform is indistinguishable from a detected one, and
+        /// a Mac-only scheme then archives for iOS and fails on the destination.
+        /// Callers that need a value choose their own fallback, knowingly.
+        var platform: ShipPlatform?
         var bundleID = ""
         /// Extensions and other embedded targets, which each need their own
         /// App ID and provisioning profile.
@@ -265,6 +268,8 @@ enum ProjectInspector {
                 info.entitlements[bundle] = relative.hasPrefix("/")
                     ? relative
                     : (root as NSString).appendingPathComponent(relative)
+            } else if let generated = synthesizedEntitlements(forBundle: bundle, settings: settings) {
+                info.entitlements[bundle] = generated
             }
 
             if wrapper == "app" || (info.bundleID.isEmpty && wrapper.isEmpty) {
@@ -274,13 +279,21 @@ enum ProjectInspector {
                 info.team = settings["DEVELOPMENT_TEAM"] as? String ?? ""
 
                 // Read the app target's platform from its own settings.
-                // SUPPORTED_PLATFORMS is "macosx" for a Mac app and
-                // "iphoneos iphonesimulator" for an iPhone app; SDKROOT is a
-                // second witness for either.
-                let platforms = (settings["SUPPORTED_PLATFORMS"] as? String ?? "").lowercased()
+                //
+                // SDKROOT is asked first because it resolves to the SDK this
+                // scheme actually builds against — a full path ending in
+                // MacOSX<version>.sdk or iPhoneOS<version>.sdk. SUPPORTED_PLATFORMS
+                // only lists what the target *could* build: a multiplatform app
+                // says "iphoneos iphonesimulator macosx", and treating any
+                // mention of macOS as proof would ship every such app as a Mac
+                // app. It stays as the fallback witness for the projects that
+                // leave SDKROOT unset.
                 let sdk = (settings["SDKROOT"] as? String ?? "").lowercased()
-                info.platform = (platforms.contains("macos") || sdk.contains("macos"))
-                    ? .macOS : .iOS
+                let platforms = (settings["SUPPORTED_PLATFORMS"] as? String ?? "").lowercased()
+                if sdk.contains("macosx") { info.platform = .macOS }
+                else if sdk.contains("iphoneos") { info.platform = .iOS }
+                else if platforms.contains("macosx") { info.platform = .macOS }
+                else if platforms.contains("iphoneos") { info.platform = .iOS }
             } else if !info.extensionBundleIDs.contains(bundle) {
                 info.extensionBundleIDs.append(bundle)
             }
@@ -296,6 +309,77 @@ enum ProjectInspector {
         if info.buildNumber.contains("$") { info.buildNumber = "" }
 
         return info
+    }
+
+    /// The entitlements Xcode would generate, written out as a file.
+    ///
+    /// A modern Mac target usually declares no `.entitlements` file at all: the
+    /// sandbox and each permission inside it are *build settings*, and Xcode
+    /// turns them into entitlements while signing. This tool archives unsigned
+    /// and signs afterwards, so that step never runs — the shipped app carries
+    /// none of them, and App Store Connect refuses the upload outright ("App
+    /// sandbox not enabled"), after a full build.
+    ///
+    /// Writing the same file Xcode would have written puts the project's own
+    /// declared permissions back where signing can find them. Nothing is
+    /// invented: every key below is one the project asked for, and a target
+    /// that never opted into the sandbox gets no file at all.
+    private static func synthesizedEntitlements(
+        forBundle bundle: String, settings: [String: Any],
+    ) -> String? {
+        func enabled(_ setting: String) -> Bool {
+            (settings[setting] as? String)?.uppercased() == "YES"
+        }
+
+        // The sandbox is the gate. Every other key is a permission *within* it,
+        // and Xcode emits none of them for an unsandboxed target.
+        guard enabled("ENABLE_APP_SANDBOX") else { return nil }
+        var entitlements: [String: Any] = ["com.apple.security.app-sandbox": true]
+
+        for (setting, key) in [
+            "ENABLE_INCOMING_NETWORK_CONNECTIONS": "com.apple.security.network.server",
+            "ENABLE_OUTGOING_NETWORK_CONNECTIONS": "com.apple.security.network.client",
+            "ENABLE_RESOURCE_ACCESS_AUDIO_INPUT": "com.apple.security.device.audio-input",
+            "ENABLE_RESOURCE_ACCESS_BLUETOOTH": "com.apple.security.device.bluetooth",
+            "ENABLE_RESOURCE_ACCESS_CALENDARS": "com.apple.security.personal-information.calendars",
+            "ENABLE_RESOURCE_ACCESS_CAMERA": "com.apple.security.device.camera",
+            "ENABLE_RESOURCE_ACCESS_CONTACTS": "com.apple.security.personal-information.addressbook",
+            "ENABLE_RESOURCE_ACCESS_LOCATION": "com.apple.security.personal-information.location",
+            "ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY":
+                "com.apple.security.personal-information.photos-library",
+            "ENABLE_RESOURCE_ACCESS_PRINTING": "com.apple.security.print",
+            "ENABLE_RESOURCE_ACCESS_USB": "com.apple.security.device.usb",
+        ] where enabled(setting) {
+            entitlements[key] = true
+        }
+
+        // File access is three-valued — off, read-only or read/write — and the
+        // level picks the *key*, not the value.
+        for (setting, prefix) in [
+            "ENABLE_USER_SELECTED_FILES": "com.apple.security.files.user-selected",
+            "ENABLE_FILE_ACCESS_DOWNLOADS_FOLDER": "com.apple.security.files.downloads",
+            "ENABLE_FILE_ACCESS_PICTURE_FOLDER": "com.apple.security.assets.pictures",
+            "ENABLE_FILE_ACCESS_MUSIC_FOLDER": "com.apple.security.assets.music",
+            "ENABLE_FILE_ACCESS_MOVIES_FOLDER": "com.apple.security.assets.movies",
+        ] {
+            switch (settings[setting] as? String)?.lowercased() {
+            case "readonly": entitlements["\(prefix).read-only"] = true
+            case "readwrite": entitlements["\(prefix).read-write"] = true
+            default: break
+            }
+        }
+
+        // Kept outside the build directory, which every run deletes before
+        // archiving — signing reads this file long after that point.
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MailBoxShip/GeneratedEntitlements", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("\(bundle).entitlements")
+        guard let data = try? PropertyListSerialization.data(
+            fromPropertyList: entitlements, format: .xml, options: 0),
+            (try? data.write(to: file)) != nil
+        else { return nil }
+        return file.path
     }
 
     /// Entitlements file per bundle id, gathered across *every* scheme.

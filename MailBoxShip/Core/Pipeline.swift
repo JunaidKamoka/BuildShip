@@ -305,6 +305,11 @@ struct Pipeline {
             throw ShipError("Couldn't find the API key file at \(input.keyPath). "
                 + "Choose the .p8 again for this profile and try once more.")
         }
+        // Asked here, before anything is built or registered, because the only
+        // other place it gets answered is validation — after a full archive and
+        // export, and in a message that names a missing .properties file rather
+        // than a missing app.
+        guard Transporter.isInstalled else { throw ShipError(Transporter.missingMessage) }
 
         let keychain = EphemeralKeychain()
         defer { Task { await keychain.destroy(log: log) } }
@@ -626,6 +631,27 @@ struct Pipeline {
                 "Scheme \(input.scheme) builds \(info.bundleID), but Bundle ID is set to "
                 + "\(input.bundleID). Nothing was created on your account. Change Bundle ID "
                 + "to \(info.bundleID), or choose the project that builds \(input.bundleID).")
+        }
+
+        // The platform, checked against what the scheme can actually build.
+        //
+        // SUPPORTED_PLATFORMS came back with the settings already read above, so
+        // this is free — and it is the last point before the run starts creating
+        // App IDs, certificates and profiles on the account. Catching it here
+        // costs nothing; catching it at the archive costs a signing setup for a
+        // build that cannot happen. Only a scheme that demonstrably lists its
+        // platforms and does not list this one objects: an unreadable setting is
+        // not evidence, and a scheme supporting several leaves the choice alone.
+        let supported = (info.buildSettings[info.bundleID]?["SUPPORTED_PLATFORMS"] ?? "")
+            .lowercased()
+        if !supported.isEmpty, !supported.contains(input.platform.supportedPlatformName) {
+            let buildable = ShipPlatform.allCases
+                .filter { supported.contains($0.supportedPlatformName) }
+            throw ShipError(
+                "Scheme \(input.scheme) cannot build for \(input.platform.displayName)"
+                + (buildable.isEmpty ? "." : " — it builds for "
+                   + buildable.map(\.displayName).joined(separator: " and ") + ".")
+                + " Set “Upload as” accordingly. Nothing was created on your account.")
         }
 
         let unknown = input.extensionBundleIDs.filter { !info.extensionBundleIDs.contains($0) }
@@ -1751,9 +1777,37 @@ struct Pipeline {
 
         let result = await Shell.run("/usr/bin/xcodebuild", args, onOutput: log)
         guard result.succeeded else {
-            throw ShipError("Archive failed. The log above has the compiler's own message.")
+            throw ShipError(archiveFailureMessage(in: result.output))
         }
         log("  Archive succeeded\n")
+    }
+
+    /// What to say when `xcodebuild archive` fails.
+    ///
+    /// Usually nothing better than the compiler's own message exists, and
+    /// paraphrasing it would only hide it. The exception is a rejected
+    /// destination: xcodebuild prints the specifier it could not match and a
+    /// list of the ones it can, but never that the two are different platforms
+    /// — so a Mac app asked to archive for iOS reads as an inscrutable wall of
+    /// `{ platform:macOS, arch:… }` lines. That one is worth naming, because
+    /// the fix is a single click on the platform picker.
+    private func archiveFailureMessage(in output: String) -> String {
+        let generic = "Archive failed. The log above has the compiler's own message."
+        guard output.contains("Unable to find a destination matching") else { return generic }
+
+        // The available destinations, as the platforms they actually name. A
+        // scheme that offers nothing for the platform being built is the case
+        // worth explaining; anything else is a genuine destination problem and
+        // keeps the generic message.
+        let offered = ShipPlatform.allCases.filter { candidate in
+            candidate != input.platform
+                && output.contains("platform:\(candidate.destinationName)")
+        }
+        guard let actual = offered.first else { return generic }
+
+        return "The \(input.scheme) scheme builds for \(actual.displayName), but this run asked "
+            + "for \(input.platform.displayName). Set “Upload as” to \(actual.displayName) and "
+            + "deploy again — nothing was uploaded."
     }
 
     private func export(profiles: [String: String], team: String) async throws -> String {
@@ -1955,7 +2009,13 @@ struct Pipeline {
             "--p8-file-path", input.keyPath,
         ], environment: input.proxyEnvironment, onOutput: log)
 
-        if result.succeeded { return .passed }
+        if result.succeeded, !Self.reportsFailure(inAltool: result.output) { return .passed }
+        // The uploader going missing between the pre-flight check and here is
+        // unlikely but not impossible, and altool's own wording for it is
+        // unreadable. Translate rather than pass it through.
+        if result.output.contains("Defaults.properties") {
+            return .failed(message: Transporter.missingMessage)
+        }
         if let previous = Self.usedBuildNumber(in: result.output) {
             return .buildNumberTaken(next: previous + 1)
         }
@@ -2051,6 +2111,26 @@ struct Pipeline {
     /// failed" on its own sends the reader back to search a log for the
     /// sentence the tool has already read. Apple's wording names the problem
     /// and its numeric code, which is also what makes it searchable.
+    /// Whether altool's own output says it failed, whatever its exit status.
+    ///
+    /// `altool` exits **zero** after printing "VERIFY FAILED with 1 error" and
+    /// refusing the package. Keying off the exit status alone therefore reads a
+    /// rejected validation as a pass: the run went on to upload, the upload
+    /// failed the same way and was read the same way, and the pipeline arrived
+    /// at "waiting for the build to register" for a build App Store Connect had
+    /// never accepted. A ship that reports success having delivered nothing is
+    /// the one failure this tool must never produce, so the output is read as
+    /// well — these banners are altool's own, printed only on refusal.
+    private static func reportsFailure(inAltool output: String) -> Bool {
+        let banners = [
+            "VERIFY FAILED", "UPLOAD FAILED",
+            "Failed to validate package", "Failed to upload package",
+            // The machine-readable code Apple attaches to a refusal.
+            "STATE_ERROR.",
+        ]
+        return banners.contains { output.contains($0) }
+    }
+
     private static func reason(fromAltool output: String) -> String? {
         for line in output.split(separator: "\n") {
             var text = String(line)
@@ -2080,7 +2160,12 @@ struct Pipeline {
             "--apiKey", input.keyID, "--apiIssuer", input.issuerID,
             "--p8-file-path", input.keyPath,
         ], environment: input.proxyEnvironment, onOutput: log)
-        guard result.succeeded else {
+        // Same as validate: altool exits zero on a refused upload, so its own
+        // output decides.
+        guard result.succeeded, !Self.reportsFailure(inAltool: result.output) else {
+            if result.output.contains("Defaults.properties") {
+                throw ShipError(Transporter.missingMessage)
+            }
             throw ShipError(Self.humanize(
                 Self.reason(fromAltool: result.output) ?? "Upload failed. See the log above."))
         }
@@ -2123,16 +2208,93 @@ extension Pipeline.Input {
     }
 }
 
+// MARK: - Upload tooling
+
+/// Finds the App Store upload runtime, which is no longer Xcode's to provide.
+///
+/// Xcode 26 stopped bundling `iTMSTransporter`. What ships now is a shim: it
+/// looks for a real one in a fixed set of places and, finding none, fails deep
+/// inside its own machinery with "The file "Defaults.properties" couldn't be
+/// opened because there is no such file." That names a resource of the missing
+/// component rather than the component, so the one thing the message cannot
+/// convey is that an app needs installing.
+///
+/// The tool answers it instead, and answers it *before* the build: this is a
+/// file-existence question costing microseconds, and letting it surface at
+/// validation spends a full archive, export and signing run to learn it.
+enum Transporter {
+
+    /// Where the runtime sits inside a bundle that carries one. Taken from the
+    /// shim's own `CDTransporterSubPaths`, so this looks exactly where it does.
+    private static let subPaths = [
+        "Contents/itms/bin/iTMSTransporter",
+        "Contents/SharedFrameworks/ContentDeliveryServices.framework/itms/bin/iTMSTransporter",
+        "Contents/Frameworks/ContentDeliveryServices.framework/itms/bin/iTMSTransporter",
+    ]
+
+    /// Bundles that might carry it: Transporter.app wherever it was installed,
+    /// and Xcode itself — versions before 26 bundle the runtime, and on those
+    /// nothing needs installing and this check must not object.
+    private static var bundles: [String] {
+        var out = ["/Applications/Transporter.app"]
+        if let home = ProcessInfo.processInfo.environment["HOME"] {
+            out.append("\(home)/Applications/Transporter.app")
+        }
+        // Shell.developerDir points at <Xcode>/Contents/Developer.
+        out.append((("\(Shell.developerDir)" as NSString)
+            .deletingLastPathComponent as NSString).deletingLastPathComponent)
+        return out
+    }
+
+    /// The runtime's path, or nil when this Mac has no uploader at all.
+    static var path: String? {
+        let fm = FileManager.default
+        for bundle in bundles {
+            for sub in subPaths {
+                let candidate = (bundle as NSString).appendingPathComponent(sub)
+                if fm.isExecutableFile(atPath: candidate) { return candidate }
+            }
+        }
+        // Installed standalone rather than as an app bundle.
+        let local = "/usr/local/itms/bin/iTMSTransporter"
+        return fm.isExecutableFile(atPath: local) ? local : nil
+    }
+
+    static var isInstalled: Bool { path != nil }
+
+    /// Said the same way wherever it is reported.
+    static let missingMessage =
+        "This Mac has no App Store uploader. Xcode 26 no longer includes one — xcrun altool "
+        + "is only a shim to it — so uploading needs Apple's free Transporter app: "
+        + "https://apps.apple.com/app/transporter/id1450874784 . Install it and deploy again. "
+        + "Nothing else is wrong: “Build IPA only” works without it, and the build already made "
+        + "is still valid."
+}
+
 // MARK: - Platform-specific shipping values
 
 extension ShipPlatform {
-    /// The `-destination` an archive is built for.
-    var archiveDestination: String {
+    /// How xcodebuild names the platform in a destination — both in the
+    /// `-destination` it is given and in the `{ platform:… }` lines it prints
+    /// back when it cannot match one.
+    var destinationName: String {
         switch self {
-        case .iOS: "generic/platform=iOS"
-        case .macOS: "generic/platform=macOS"
+        case .iOS: "iOS"
+        case .macOS: "macOS"
         }
     }
+
+    /// How the platform appears in a target's `SUPPORTED_PLATFORMS`, which
+    /// spells them as SDK names — "macosx", "iphoneos iphonesimulator".
+    var supportedPlatformName: String {
+        switch self {
+        case .iOS: "iphoneos"
+        case .macOS: "macosx"
+        }
+    }
+
+    /// The `-destination` an archive is built for.
+    var archiveDestination: String { "generic/platform=\(destinationName)" }
 
     /// `altool`'s `-t` on validate and upload.
     var altoolType: String {
