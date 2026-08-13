@@ -321,6 +321,7 @@ struct Pipeline {
         try await requirePlatformOnRecord(appID: appID, client: context.client)
 
         let (buildStart, versionStart) = await resolveAgainstAppStore(
+            context: context, appID: appID)
         var buildOverride = buildStart
         var versionOverride = versionStart
 
