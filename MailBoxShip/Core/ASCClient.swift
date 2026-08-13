@@ -210,20 +210,39 @@ struct ASCClient {
         let identifier: String
     }
 
-    /// Every build number ever uploaded for an app, following the cursor to the
-    /// end — the first page holds the *newest* uploads, and the highest number
-    /// is not necessarily among them.
-    func allBuildNumbers(appID: String) async -> [Int] {
-        let items = (try? await requestAll("/v1/builds?filter[app]=\(appID)&limit=200")) ?? []
+    /// Every build number ever uploaded for an app *on one platform*, following
+    /// the cursor to the end — the first page holds the *newest* uploads, and
+    /// the highest number is not necessarily among them.
+    ///
+    /// The platform filter is not optional. One app record can hold an iOS and
+    /// a macOS app, and their build numbers are counted separately: a Mac run
+    /// that reads the iOS numbers picks one Apple has never seen on the Mac
+    /// side, skipping the whole sequence, or worse adopts a number the Mac
+    /// train already used and is rejected at validation.
+    func allBuildNumbers(appID: String, platform: String) async -> [Int] {
+        await buildNumberStrings(appID: appID, platform: platform).compactMap(Int.init)
+    }
+
+    /// Build numbers as Apple stores them — strings, since a project is free to
+    /// use "1.2.3" where this tool assumes an integer.
+    func buildNumberStrings(appID: String, platform: String) async -> [String] {
+        let items = (try? await requestAll(
+            "/v1/builds?filter[app]=\(appID)"
+            + "&filter[preReleaseVersion.platform]=\(platform)&limit=200")) ?? []
         return items.compactMap {
-            Int(($0["attributes"] as? [String: Any])?["version"] as? String ?? "")
+            ($0["attributes"] as? [String: Any])?["version"] as? String
         }
     }
 
-    /// Every App Store version of an app with its state — what decides whether
-    /// a version string is still open for new builds or its train has closed.
-    func appStoreVersionStrings(appID: String) async throws -> [(version: String, state: String)] {
-        let items = try await requestAll("/v1/apps/\(appID)/appStoreVersions?limit=200")
+    /// Every App Store version of an app on one platform with its state — what
+    /// decides whether a version string is still open for new builds or its
+    /// train has closed. Platform-filtered for the same reason build numbers
+    /// are: the iOS and macOS sides of one record have independent trains.
+    func appStoreVersionStrings(
+        appID: String, platform: String,
+    ) async throws -> [(version: String, state: String)] {
+        let items = try await requestAll(
+            "/v1/apps/\(appID)/appStoreVersions?filter[platform]=\(platform)&limit=200")
         return items.compactMap {
             guard let attributes = $0["attributes"] as? [String: Any],
                   let version = attributes["versionString"] as? String
@@ -231,6 +250,22 @@ struct ASCClient {
             return (version, attributes["appStoreState"] as? String
                     ?? attributes["appVersionState"] as? String ?? "")
         }
+    }
+
+    /// The platforms an app record actually holds — "IOS", "MAC_OS", "TV_OS".
+    ///
+    /// Creating a record for a platform also creates that platform's first 1.0
+    /// version, so the set of version platforms is the set of platforms the
+    /// record can accept a build for. Worth asking before a build starts: a
+    /// package delivered against a platform the record does not have is taken
+    /// by the upload service and then discarded, which looks from here like a
+    /// clean upload that never appears.
+    func recordPlatforms(appID: String) async -> Set<String> {
+        let items = (try? await requestAll(
+            "/v1/apps/\(appID)/appStoreVersions?limit=200")) ?? []
+        return Set(items.compactMap {
+            ($0["attributes"] as? [String: Any])?["platform"] as? String
+        })
     }
 
     /// Exact-match lookup, falling back to a full scan.

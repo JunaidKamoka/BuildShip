@@ -316,7 +316,11 @@ struct Pipeline {
         // are one API call each. Explicitly configured values are exactly the
         // ones that need checking: they stay whatever they were until someone
         // edits them, so they clash on every ship after the first.
-        let (buildStart, versionStart) = await resolveAgainstAppStore(context: context)
+        let appID = input.bundleID.isEmpty
+            ? nil : try? await context.client.appID(bundleID: input.bundleID)
+        try await requirePlatformOnRecord(appID: appID, client: context.client)
+
+        let (buildStart, versionStart) = await resolveAgainstAppStore(
         var buildOverride = buildStart
         var versionOverride = versionStart
 
@@ -374,9 +378,83 @@ struct Pipeline {
             onStage(.upload)
             log("\n→ Uploading…\n")
             try await upload(ipa: ipa)
+
+            // The build number this run actually stamped, in the same order
+            // `assemble` resolves it — the override, else the explicit field,
+            // else whatever the project carries.
+            let shipped = buildOverride
+                ?? (input.buildNumber.isEmpty ? context.projectInfo.buildNumber : input.buildNumber)
+            await confirmArrival(appID: appID, client: context.client, buildNumber: shipped)
+            return
+        }
+    }
+
+    /// Refuse a run whose platform the app record cannot accept.
+    ///
+    /// Apple's upload service takes a package addressed to a bundle id without
+    /// checking that the record behind it has that platform, and App Store
+    /// Connect then discards it. `altool` exits zero, this tool says uploaded,
+    /// and the build never appears anywhere — no error, no entry, only an
+    /// email to the account holder. Asking the record what platforms it has
+    /// costs one call and turns that into a refusal before anything is built.
+    ///
+    /// Only a record that demonstrably holds *another* platform is rejected.
+    /// An empty or unreadable answer means the question could not be settled,
+    /// and a check that cannot see is not allowed to block a ship.
+    private func requirePlatformOnRecord(appID: String?, client: ASCClient) async throws {
+        guard let appID else { return }
+        let platforms = await client.recordPlatforms(appID: appID)
+        let wanted = input.platform.storePlatform
+        guard !platforms.isEmpty, !platforms.contains(wanted) else { return }
+
+        let has = platforms.map { $0 == "MAC_OS" ? "macOS" : $0 == "IOS" ? "iOS" : $0 }
+            .sorted().joined(separator: " and ")
+        throw ShipError(
+            "The App Store Connect record for \(input.bundleID) is \(has)-only — it has no "
+            + "\(input.platform.displayName) app. Apple would accept the upload and then discard "
+            + "the build, so nothing was built. A \(input.platform.displayName) app needs its own "
+            + "record, and Apple will not let a second record reuse this bundle id — give the "
+            + "\(input.platform.displayName) target a different one. (Mac Catalyst is the "
+            + "exception that shares a record, and this tool does not build Catalyst yet.)"
+        )
+    }
+
+    /// Wait for the uploaded build to actually show up in App Store Connect.
+    ///
+    /// `altool` exiting zero means the package was *accepted for delivery*, not
+    /// that it became a build — the two come apart often enough, and silently
+    /// enough, that reporting the first as if it were the second is how a ship
+    /// gets called done with nothing on the other end. So the claim is checked
+    /// before it is made.
+    private func confirmArrival(appID: String?, client: ASCClient, buildNumber: String) async {
+        guard let appID, !buildNumber.isEmpty else {
             log("\n✅ Uploaded. Processing in App Store Connect takes 5–15 minutes.\n")
             return
         }
+
+        log("\n→ Waiting for App Store Connect to register the build…\n")
+        // Six minutes — twelve waits of thirty seconds after the first look.
+        // Apple usually lists a build within two, and past six a wait long
+        // enough to be sure is longer than anyone will watch.
+        for attempt in 1...13 {
+            if attempt > 1 { try? await Task.sleep(for: .seconds(30)) }
+            let seen = await client.buildNumberStrings(
+                appID: appID, platform: input.platform.storePlatform)
+            if seen.contains(buildNumber) {
+                log("\n✅ Uploaded — build \(buildNumber) is in App Store Connect and processing. "
+                    + "It becomes selectable in 5–15 minutes.\n")
+                return
+            }
+        }
+
+        log("""
+
+            ⚠️ Apple accepted the upload but build \(buildNumber) has not appeared in App Store \
+            Connect after six minutes. That usually means the build was discarded after delivery \
+            rather than queued — check the email on the Apple ID for this account, which is where \
+            Apple explains why. Do not assume this build shipped.
+
+            """)
     }
 
     /// One past the highest build number App Store Connect already has for this
@@ -399,10 +477,9 @@ struct Pipeline {
     /// unauthenticated lookup supplies the released version as a fallback, so
     /// the check degrades rather than disappears.
     private func resolveAgainstAppStore(
-        context: BuildContext,
+        context: BuildContext, appID: String?,
     ) async -> (buildOverride: String?, versionOverride: String?) {
         guard !input.bundleID.isEmpty else { return (nil, nil) }
-        let appID = try? await context.client.appID(bundleID: input.bundleID)
 
         // The version whose train matters: the explicit field, else the
         // project's own, read during preflight.
@@ -411,7 +488,8 @@ struct Pipeline {
 
         var versions: [(version: String, state: String)] = []
         if let appID {
-            versions = (try? await context.client.appStoreVersionStrings(appID: appID)) ?? []
+            versions = (try? await context.client.appStoreVersionStrings(
+                appID: appID, platform: input.platform.storePlatform)) ?? []
         }
         // Apple's public store lookup is an independent witness that needs no
         // App Store Connect visibility at all — the app record can sit under a
@@ -446,7 +524,10 @@ struct Pipeline {
         }
 
         var numbers: [Int] = []
-        if let appID { numbers = await context.client.allBuildNumbers(appID: appID) }
+        if let appID {
+            numbers = await context.client.allBuildNumbers(
+                appID: appID, platform: input.platform.storePlatform)
+        }
         var buildOverride: String?
         if let highest = numbers.max(),
            input.buildNumber.isEmpty || (Int(input.buildNumber) ?? 0) <= highest {
@@ -469,6 +550,13 @@ struct Pipeline {
 
     /// The version live on the App Store, from Apple's free unauthenticated
     /// lookup — the fallback witness when the App Store Connect call fails.
+    ///
+    /// The result is only accepted when its `kind` matches the platform being
+    /// shipped ("software" for iOS, "mac-software" for the Mac App Store).
+    /// The lookup answers by bundle id alone and ignores `entity`, so on a Mac
+    /// run it will happily hand back the *iOS* listing — and that version, fed
+    /// into the train logic below as a closed release, bumps the Mac version
+    /// past a release the Mac side never had.
     private func liveVersionFromStoreLookup() async -> String? {
         guard let url = URL(string:
             "https://itunes.apple.com/lookup?bundleId=\(input.bundleID)&country=us")
@@ -477,7 +565,8 @@ struct Pipeline {
         configuration.connectionProxyDictionary = input.proxyDictionary
         guard let (data, _) = try? await URLSession(configuration: configuration).data(from: url),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let first = (json["results"] as? [[String: Any]])?.first
+              let first = (json["results"] as? [[String: Any]])?.first,
+              first["kind"] as? String == input.platform.storeKind
         else { return nil }
         return first["version"] as? String
     }
@@ -2066,6 +2155,26 @@ extension ShipPlatform {
         switch self {
         case .iOS: "IOS"
         case .macOS: "MAC_OS"
+        }
+    }
+
+    /// Platform as App Store Connect names it, for filtering versions and
+    /// builds. Spelled the same as `bundleIDPlatform` and kept separate anyway:
+    /// they are two different Apple enums that happen to agree today, and the
+    /// portal's also has `UNIVERSAL`, which App Store Connect has no idea about.
+    var storePlatform: String {
+        switch self {
+        case .iOS: "IOS"
+        case .macOS: "MAC_OS"
+        }
+    }
+
+    /// `kind` in an iTunes lookup result — how the public store says which
+    /// platform a listing is for.
+    var storeKind: String {
+        switch self {
+        case .iOS: "software"
+        case .macOS: "mac-software"
         }
     }
 
