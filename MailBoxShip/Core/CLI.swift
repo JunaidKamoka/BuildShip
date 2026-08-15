@@ -77,7 +77,6 @@ enum CLI {
                 issuerID: profile.issuerID,
                 marketingVersion: profile.marketingVersion,
                 buildNumber: profile.buildNumber,
-                allowCertificateReplacement: profile.allowCertificateReplacement,
                 entitlementsByBundleID: detected.entitlements,
                 proxyDictionary: profile.proxy.sessionProxyDictionary,
                 proxyEnvironment: profile.proxy.toolEnvironment,

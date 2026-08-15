@@ -74,13 +74,6 @@ struct ShipProfile: Codable, Identifiable, Hashable {
         platformOverride ?? detected ?? detectedPlatform ?? .iOS
     }
 
-    /// Permit revoking the oldest certificate when Apple refuses a new one.
-    ///
-    /// Saved with the store rather than held in view state: it used to reset on
-    /// every launch, so a run that needed it silently failed at the same step
-    /// with the toggle sitting innocently off.
-    var allowCertificateReplacement = false
-
     var lastUsed: Date = Date()
 
     /// Egress proxy for this profile. Its password lives in the Keychain,
@@ -136,8 +129,6 @@ struct ShipProfile: Codable, Identifiable, Hashable {
         lastUsed = (try? c.decodeIfPresent(Date.self, forKey: .lastUsed)) as? Date ?? Date()
         proxy = (try? c.decodeIfPresent(ProxyConfig.self, forKey: .proxy)) as? ProxyConfig
             ?? ProxyConfig()
-        allowCertificateReplacement =
-            (try? c.decodeIfPresent(Bool.self, forKey: .allowCertificateReplacement)) as? Bool ?? false
         reviewFirstName = str(.reviewFirstName)
         reviewLastName = str(.reviewLastName)
         reviewEmail = str(.reviewEmail)

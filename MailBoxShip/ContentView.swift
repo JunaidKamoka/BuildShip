@@ -706,17 +706,14 @@ struct AdvancedView: View {
 
             Divider().padding(.vertical, 2)
 
-            Toggle(isOn: store.boolBinding(\.allowCertificateReplacement)) {
-                Text("Replace oldest certificate if at limit")
-                    .font(.system(size: 12))
-            }
-            .toggleStyle(.switch)
-            .controlSize(.small)
+            Text("Certificates")
+                .font(.system(size: 12, weight: .medium))
 
             Text("Apple caps certificates per account and refuses the next one. This tool "
                  + "cannot reuse existing certificates — their private keys live on the "
-                 + "machines that made them. Enabling this revokes the oldest, which breaks "
-                 + "signing for anyone still using it.")
+                 + "machines that made them — so at the limit it revokes the oldest "
+                 + "automatically and retries, naming each one it removes in the log. That "
+                 + "breaks signing for anyone still using the revoked certificate.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

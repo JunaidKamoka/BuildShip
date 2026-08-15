@@ -48,12 +48,6 @@ struct Pipeline {
         var issuerID: String
         var marketingVersion: String
         var buildNumber: String
-        /// Permit revoking the oldest certificate when Apple refuses a new one.
-        ///
-        /// Off by default and surfaced as an explicit choice, because revoking
-        /// is destructive to whoever else is using that certificate — it can
-        /// invalidate provisioning profiles already in use on other machines.
-        var allowCertificateReplacement: Bool = false
 
         /// Resolved entitlements file per bundle id, filled in by detection.
         ///
@@ -823,7 +817,15 @@ struct Pipeline {
         // certificate" — it does not say how many over you are. An account
         // sitting two or three above the limit therefore needs several
         // revocations, and a single retry just fails again with the identical
-        // message, which reads like the replacement setting did nothing.
+        // message, which reads like nothing was done.
+        //
+        // Automatic, not opt-in. Reusing the existing certificates is
+        // impossible here — their private keys live on the machines that made
+        // them — so at the cap the only route to a build is to revoke one, and
+        // a run that stops to ask has nothing else to offer. Revoking is still
+        // destructive to whoever else signs with that certificate, so it
+        // happens only after Apple actually refuses, takes the oldest first,
+        // and names every certificate it removes in the log.
         let maxRevocations = 5
         var revoked = 0
 
@@ -832,24 +834,6 @@ struct Pipeline {
                 return try await client.createCertificate(type: type, csr: csr)
             } catch let error as ShipError where error.message.contains("409") {
                 let existing = (try? await client.certificates(type: type)) ?? []
-
-                guard input.allowCertificateReplacement else {
-                    let names = existing
-                        .map { "      • \($0.displayName) (expires \($0.expirationDate.prefix(10)))" }
-                        .joined(separator: "\n")
-                    throw ShipError("""
-                        Apple refused a new \(type.lowercased()) certificate — this account is at its limit.
-
-                        It already holds \(existing.count):
-                        \(names)
-
-                        This tool cannot reuse those: their private keys live on the machines that \
-                        created them, not this one.
-
-                        Either revoke one at developer.apple.com → Certificates, or turn on \
-                        "Replace oldest certificate if at limit" and run again.
-                        """)
-                }
 
                 guard revoked < maxRevocations else {
                     throw ShipError(
@@ -2198,7 +2182,6 @@ extension Pipeline.Input {
             issuerID: p.issuerID,
             marketingVersion: p.marketingVersion,
             buildNumber: p.buildNumber,
-            allowCertificateReplacement: p.allowCertificateReplacement,
             entitlementsByBundleID: entitlementsByBundleID,
             proxyDictionary: p.proxy.sessionProxyDictionary,
             proxyEnvironment: p.proxy.toolEnvironment,
