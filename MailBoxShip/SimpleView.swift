@@ -24,6 +24,9 @@ struct SimpleView: View {
     /// Checked once rather than per render — it is a handful of filesystem
     /// probes, and a view body is not the place for them.
     @State private var uploaderInstalled = true
+    /// Reveals the Issuer ID field even once one is set, so a resolved-but-wrong
+    /// value can be corrected without going to the advanced screen.
+    @State private var editingIssuer = false
 
     private var p: ShipProfile { store.current }
     private var bothChosen: Bool { !p.projectPath.isEmpty && !p.keyPath.isEmpty }
@@ -293,8 +296,15 @@ struct SimpleView: View {
 
     /// Only asks for the issuer when nothing could resolve it — a known key, a
     /// saved profile or the baked registry all skip this entirely.
+    ///
+    /// When one *is* resolved it is shown rather than merely announced. "Issuer
+    /// resolved" with the value hidden is a claim the screen cannot back up: the
+    /// issuer belongs to an account, the key belongs to an account, and nothing
+    /// here has checked they are the same one. Showing it — and keeping it
+    /// editable — is what lets a wrong pairing be seen before a run, instead of
+    /// as a 401 five seconds in.
     @ViewBuilder private var issuerRow: some View {
-        if p.issuerID.isEmpty {
+        if p.issuerID.isEmpty || editingIssuer {
             HStack(spacing: 8) {
                 Image(systemName: "questionmark.circle").font(.system(size: 11))
                     .foregroundStyle(Design.warning)
@@ -302,12 +312,21 @@ struct SimpleView: View {
                           text: store.binding(\.issuerID))
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 12, design: .monospaced))
+                    .onSubmit { editingIssuer = false }
             }
         } else {
             HStack(spacing: 6) {
                 Image(systemName: "checkmark.seal.fill").font(.system(size: 11))
                     .foregroundStyle(Design.success)
-                Text("Issuer resolved").font(.system(size: 11)).foregroundStyle(.secondary)
+                Text("Issuer \(p.issuerID)")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Button("Change") { editingIssuer = true }
+                    .buttonStyle(.link)
+                    .font(.system(size: 11))
+                Spacer()
             }
         }
     }

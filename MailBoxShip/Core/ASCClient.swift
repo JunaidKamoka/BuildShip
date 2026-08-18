@@ -97,6 +97,21 @@ struct ASCClient {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
 
         guard (200..<300).contains(status) else {
+            // A 401 here is almost never "the token expired" — it is minted
+            // seconds earlier. It is the pairing: Apple checks the signature
+            // against the key named by `kid`, then checks that key belongs to
+            // the account named by `iss`. Mismatch the two — swap the .p8 on a
+            // store and keep the previous account's issuer — and the reply is
+            // this same opaque sentence. Say which pair was sent instead.
+            if status == 401 {
+                throw ShipError(
+                    "App Store Connect rejected this key (401). Key \(keyID) was sent "
+                    + "with Issuer ID \(issuerID) — the two have to belong to the *same* "
+                    + "account. Check the Issuer ID at App Store Connect → Users and "
+                    + "Access → Integrations → App Store Connect API, and that the key "
+                    + "is still active there."
+                )
+            }
             throw ShipError("\(method) \(path) failed (\(status)): \(Self.describe(data))")
         }
         guard !data.isEmpty else { return [:] }
