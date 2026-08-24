@@ -21,10 +21,12 @@ struct SimpleView: View {
     @State private var team = ""
     @State private var copiedLog = false
     @State private var showSync = false
-    @State private var editingIssuer = false
     /// Checked once rather than per render — it is a handful of filesystem
     /// probes, and a view body is not the place for them.
     @State private var uploaderInstalled = true
+    /// Reveals the Issuer ID field even once one is set, so a resolved-but-wrong
+    /// value can be corrected without going to the advanced screen.
+    @State private var editingIssuer = false
 
     private var p: ShipProfile { store.current }
     private var bothChosen: Bool { !p.projectPath.isEmpty && !p.keyPath.isEmpty }

@@ -450,6 +450,7 @@ final class ProfileStore: ObservableObject {
     /// to explain it.
     func adoptKey(path: String) {
         guard let selectedIndex else { return }
+        let previousKeyID = profiles[selectedIndex].keyID
         profiles[selectedIndex].keyPath = path
 
         let name = (path as NSString).lastPathComponent
@@ -472,6 +473,14 @@ final class ProfileStore: ObservableObject {
             ?? Deployment.issuer(forKeyID: keyID)
         if let known {
             profiles[selectedIndex].issuerID = known
+        } else if keyID != previousKeyID {
+            // A key this tool has never seen, replacing a different one: the
+            // issuer sitting here was resolved for the *previous* key and says
+            // nothing about this one. Keeping it is worse than having none —
+            // the screen reports the issuer as resolved and the run dies at
+            // authentication with a 401 that names neither half of the pair.
+            // Clearing it asks the one question that actually needs answering.
+            profiles[selectedIndex].issuerID = ""
         }
         scheduleSave()
     }
