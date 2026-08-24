@@ -171,9 +171,14 @@ struct AdvancedView: View {
             }
 
             Divider()
+            if let result = runner.result {
+                ResultCard(result: result, compact: true)
+                Divider()
+            }
             runBar
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .animation(.easeInOut(duration: 0.2), value: runner.result)
         .sheet(isPresented: $showingLog) { logSheet }
         .sheet(isPresented: $showSync) { SyncView(sync: sync) }
         // Read the project on arrival and whenever another profile is selected.
@@ -222,6 +227,15 @@ struct AdvancedView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            Button { Builds.open() } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "tray.full").font(.system(size: 10))
+                    Text("Builds").font(.system(size: 11))
+                }
+            }
+            .buttonStyle(.borderless)
+            .help("Open the folder every finished build is kept in")
 
             Button(action: onSimple) {
                 HStack(spacing: 4) {
@@ -1204,6 +1218,12 @@ final class Runner: ObservableObject {
     @Published private(set) var currentStage: Pipeline.Stage?
     @Published private(set) var steps: [Pipeline.Stage] = []
 
+    /// What the last successful run produced. Held past the end of the run so
+    /// the screen can keep offering the artifact — the log line naming it is
+    /// gone as soon as anything else is built, and the folder it lands in is
+    /// not one anyone opens by habit.
+    @Published private(set) var result: BuildResult?
+
     private var completed: Set<Pipeline.Stage> = []
     private var task: Task<Void, Never>?
 
@@ -1241,6 +1261,7 @@ final class Runner: ObservableObject {
         failed = true
         finished = true
         steps = []
+        result = nil
         status = short
         logStore.mutate { $0 = detail + "\n" }
         log = Self.tail(of: detail + "\n")
@@ -1259,6 +1280,7 @@ final class Runner: ObservableObject {
         log = ""
         completed = []
         currentStage = nil
+        result = nil
         steps = Pipeline.Stage.steps(upload: upload)
         status = upload ? "Building and uploading…" : "Building…"
 
@@ -1297,16 +1319,19 @@ final class Runner: ObservableObject {
             }
             do {
                 if upload {
-                    try await pipeline.shipToAppStore()
+                    let ipa = try await pipeline.shipToAppStore()
                     if let last = currentStage { completed.insert(last) }
                     currentStage = nil
                     status = "Uploaded to App Store Connect"
+                    append("\n✅ Uploaded — \(ipa)\n")
+                    result = BuildResult(path: ipa, uploaded: true)
                 } else {
                     let ipa = try await pipeline.buildIPA()
                     if let last = currentStage { completed.insert(last) }
                     currentStage = nil
                     status = "Built"
                     append("\n✅ \(ipa)\n")
+                    result = BuildResult(path: ipa, uploaded: false)
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: ipa)])
                 }
             } catch {

@@ -61,6 +61,61 @@ enum Capabilities {
     /// store submission is far more expensive than asserting it here.
     static let alwaysOn = ["IN_APP_PURCHASE"]
 
+    /// Capabilities Apple will not turn on from a `capabilityType` alone.
+    ///
+    /// The portal's toggle for these asks a second question, and the API
+    /// expects that answer in the create request rather than defaulting it.
+    /// Sign in with Apple is the one that matters in practice: its toggle also
+    /// declares whether this App ID is the *primary* one of a sign-in group,
+    /// which is what a single app always is.
+    ///
+    /// Anything needing a setting that cannot be guessed — a data protection
+    /// level is a real choice about the app, not a formality — is deliberately
+    /// absent, so Apple refuses it and the refusal is reported rather than a
+    /// level being picked on someone's behalf.
+    static let settings: [String: [[String: Any]]] = [
+        "APPLE_ID_AUTH": [[
+            "key": "APPLE_ID_AUTH_APP_CONSENT",
+            "options": [["key": "PRIMARY_APP_CONSENT"]],
+        ]],
+        "ICLOUD": [[
+            "key": "ICLOUD_VERSION",
+            "options": [["key": "XCODE_6"]],
+        ]],
+    ]
+
+    /// Entitlements safe to take from a provisioning profile when the target
+    /// itself declares none.
+    ///
+    /// A capability enabled on the App ID lands in the profile, but the profile
+    /// only grants permission — the shipped binary still has to *claim* the
+    /// entitlement, and that claim comes from the project. A target that never
+    /// got an entitlements file therefore ships without it: Sign in with Apple
+    /// is enabled on the App ID, the profile carries it, the build uploads
+    /// cleanly, and the button fails on a real device with nothing to explain
+    /// why. Adopting the key from the profile closes that gap.
+    ///
+    /// Restricted to capabilities that name nothing outside the app. An app
+    /// group, an iCloud container or an associated domain is a claim on a
+    /// specific external resource, and taking a team's whole list because the
+    /// profile happens to carry it would sign an app for things it has no
+    /// business claiming. These are the ones that are simply on or off, and the
+    /// value used is the profile's own — nothing here is invented.
+    static let adoptable: Set<String> = [
+        "aps-environment",
+        "com.apple.developer.applesignin",
+        "com.apple.developer.devicecheck.appattest-environment",
+        "com.apple.developer.game-center",
+        "com.apple.developer.healthkit",
+        "com.apple.developer.siri",
+        "com.apple.developer.kernel.increased-memory-limit",
+        "com.apple.developer.usernotifications.time-sensitive",
+        "com.apple.developer.group-session",
+        "com.apple.developer.family-controls",
+        "com.apple.developer.push-to-talk",
+        "com.apple.developer.on-demand-install-capable",
+    ]
+
     /// Entitlements with no API-settable capability.
     ///
     /// Communication Notifications is the one that matters in practice: the

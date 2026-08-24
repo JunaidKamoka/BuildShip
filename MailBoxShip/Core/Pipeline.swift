@@ -263,6 +263,7 @@ struct Pipeline {
                      buildNumber: buildNumberOverride ?? input.buildNumber,
                      marketingVersion: marketingVersionOverride ?? input.marketingVersion)
         try repairArchive(team: context.team)
+        ensureAppCategory(inArchiveAt: archivePath)
 
         // The archive is the first place a companion watch app becomes visible,
         // so top up the profile map from what was actually built — this is also
@@ -289,7 +290,13 @@ struct Pipeline {
 
     /// Build, validate and upload — bumping the build number and rebuilding on
     /// its own if App Store Connect reports the number as already used.
-    func shipToAppStore() async throws {
+    ///
+    /// Returns the artifact that was uploaded, which is kept outside the build
+    /// directory: an accepted upload is still the build someone will want to
+    /// open, hand over or archive, and the copy is the only one that survives
+    /// the next run.
+    @discardableResult
+    func shipToAppStore() async throws -> String {
         guard input.configuration == .release else {
             throw ShipError("Only a Release build can be uploaded to App Store Connect.")
         }
@@ -385,7 +392,7 @@ struct Pipeline {
             let shipped = buildOverride
                 ?? (input.buildNumber.isEmpty ? context.projectInfo.buildNumber : input.buildNumber)
             await confirmArrival(appID: appID, client: context.client, buildNumber: shipped)
-            return
+            return ipa
         }
     }
 
@@ -1052,13 +1059,8 @@ struct Pipeline {
         // one afterwards has no effect on it.
         let keys = Capabilities.entitlementKeys(atPath: entitlementsPath)
         let (enable, manual) = Capabilities.resolve(entitlementKeys: keys)
-
-        for capability in enable {
-            await client.enableCapability(capability, bundleIDResource: resource)
-        }
-        if !enable.isEmpty {
-            log("    capabilities: \(enable.joined(separator: ", "))\n")
-        }
+        await applyCapabilities(enable, entitlements: keys,
+                                client: client, resource: resource)
         for note in manual {
             // Cannot be fixed from here, and silently omitting it would produce
             // an archive failure that names the profile instead.
@@ -1083,6 +1085,57 @@ struct Pipeline {
         }
         log("  \(identifier) → \(profile.uuid)\n")
         return (identifier, profile.name, file)
+    }
+
+    /// Turn on the capabilities a target's entitlements imply, and say what
+    /// actually happened to each one.
+    ///
+    /// The previous version fired each request, discarded the result and then
+    /// printed the full list as though it had worked. That reads as a report
+    /// and is not one: a capability Apple refuses — Sign in with Apple without
+    /// its consent setting was the case that prompted this — left a profile
+    /// missing the feature, a log claiming otherwise, and a failure that
+    /// surfaces later as an archive error naming the profile.
+    private func applyCapabilities(
+        _ wanted: [String], entitlements keys: [String],
+        client: ASCClient, resource: String,
+    ) async {
+        guard !wanted.isEmpty else { return }
+
+        let already = await client.capabilities(bundleIDResource: resource)
+        var enabled: [String] = []
+        var refused: [(capability: String, reason: String)] = []
+
+        for capability in wanted where !already.contains(capability) {
+            if let reason = await client.enableCapability(
+                capability, bundleIDResource: resource) {
+                refused.append((capability, reason))
+            } else {
+                enabled.append(capability)
+            }
+        }
+
+        let unchanged = wanted.filter { already.contains($0) }
+        var parts: [String] = []
+        if !enabled.isEmpty { parts.append("enabled \(enabled.joined(separator: ", "))") }
+        if !unchanged.isEmpty { parts.append("already on \(unchanged.joined(separator: ", "))") }
+        if !parts.isEmpty { log("    capabilities: \(parts.joined(separator: "; "))\n") }
+
+        for (capability, reason) in refused {
+            // An entitlement the project actually declares is the serious case:
+            // the archive will fail, or the feature ships dead. One Apple asks
+            // for on every App ID is not worth alarming anyone over.
+            let declared = keys.contains { Capabilities.map[$0] == capability }
+            if declared {
+                log("    ⚠︎ Could not enable \(capability), which this target's "
+                    + "entitlements require: \(reason)\n"
+                    + "      The profile will not carry it. Enable it at "
+                    + "developer.apple.com → Identifiers → \(input.bundleID), or the "
+                    + "archive will fail naming the profile instead of this.\n")
+            } else {
+                log("    · \(capability) not set: \(reason)\n")
+            }
+        }
     }
 
     /// Ensure every bundle the archive actually embeds has a profile, creating
@@ -1345,10 +1398,11 @@ struct Pipeline {
         for (path, plist) in bundles {
             guard let identifier = bundleIdentifier(atPlist: plist) else { continue }
             let declaredAs = originalByRenamed[identifier] ?? identifier
-            guard var resolved = try await resolvedEntitlements(
+            // Not a `guard`: a target that declares nothing can still need
+            // entitlements adopted from its profile below.
+            var resolved = try await resolvedEntitlements(
                 for: declaredAs, signedAs: identifier, team: team,
                 sourceOverride: extraEntitlements[declaredAs])
-            else { continue }
 
             // On iOS, a bundle can only be signed with entitlements its
             // provisioning profile carries — export refuses anything more
@@ -1362,21 +1416,44 @@ struct Pipeline {
             // keys, and its export accepts the full declared set.
             if input.platform == .iOS, let profile = profileFiles[identifier] {
                 let allowed = await Self.profileEntitlements(at: profile)
-                let unsupported = Self.entitlementKeysUnsupported(
-                    byProfile: allowed, atEntitlementsFile: resolved.file)
-                if !allowed.isEmpty, !unsupported.isEmpty {
-                    resolved = try Self.removingKeys(
-                        unsupported, fromEntitlementsAt: resolved.file)
-                    for key in unsupported.sorted() {
-                        log("  ⚠︎ \(identifier): dropped \(key) — its provisioning "
-                            + "profile cannot sign that value. Assign the capability's "
-                            + "details (the app group, say) to the App ID in the "
-                            + "developer portal to restore it.\n")
+
+                if let current = resolved {
+                    let unsupported = Self.entitlementKeysUnsupported(
+                        byProfile: allowed, atEntitlementsFile: current.file)
+                    if !allowed.isEmpty, !unsupported.isEmpty {
+                        resolved = try Self.removingKeys(
+                            unsupported, fromEntitlementsAt: current.file)
+                        for key in unsupported.sorted() {
+                            log("  ⚠︎ \(identifier): dropped \(key) — its provisioning "
+                                + "profile cannot sign that value. Assign the capability's "
+                                + "details (the app group, say) to the App ID in the "
+                                + "developer portal to restore it.\n")
+                        }
+                    }
+                }
+
+                // The mirror of that drop. A capability turned on for this App
+                // ID that the target never declared is carried by the profile
+                // and absent from the binary — which is a build that uploads
+                // cleanly and then does not work. Take it from the profile,
+                // with the profile's own value.
+                let adopt = allowed.filter {
+                    Capabilities.adoptable.contains($0.key)
+                        && !(resolved?.keys.contains($0.key) ?? false)
+                }
+                if !adopt.isEmpty {
+                    resolved = try Self.adding(
+                        adopt, toEntitlementsAt: resolved?.file,
+                        stagedAs: identifier, in: work)
+                    for key in adopt.keys.sorted() {
+                        log("  + \(identifier): adopted \(key) — enabled on the App ID "
+                            + "but not declared by the target, so the shipped app would "
+                            + "not have carried it.\n")
                     }
                 }
             }
-            guard !resolved.keys.isEmpty else { continue }
-            declared.append((path, identifier, resolved.file, resolved.keys))
+            guard let final = resolved, !final.keys.isEmpty else { continue }
+            declared.append((path, identifier, final.file, final.keys))
         }
 
         // A project that declares no entitlements anywhere needs no signing
@@ -1495,6 +1572,36 @@ struct Pipeline {
             if !covered { unsupported.insert(key) }
         }
         return unsupported
+    }
+
+    /// Rewrite — or create — a staged entitlements file carrying extra keys.
+    ///
+    /// `file` is nil when the target declared no entitlements at all, which is
+    /// exactly the case adoption exists for: there is nothing to amend, so the
+    /// staged file is written from scratch.
+    private static func adding(
+        _ values: [String: Any], toEntitlementsAt file: URL?,
+        stagedAs identifier: String, in work: URL,
+    ) throws -> (file: URL, keys: Set<String>) {
+        var plist: [String: Any] = [:]
+        if let file, let data = FileManager.default.contents(atPath: file.path),
+           let existing = try? PropertyListSerialization.propertyList(
+               from: data, format: nil) as? [String: Any] {
+            plist = existing
+        }
+        for (key, value) in values { plist[key] = value }
+
+        let destination = file ?? work.appendingPathComponent(
+            "build/entitlements-\(pathSafe(identifier)).plist")
+        try? FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        guard let data = try? PropertyListSerialization.data(
+                  fromPropertyList: plist, format: .xml, options: 0),
+              (try? data.write(to: destination)) != nil
+        else {
+            throw ShipError("Could not stage the adopted entitlements for \(identifier).")
+        }
+        return (destination, Set(plist.keys))
     }
 
     /// Rewrite an entitlements file without the given keys.
@@ -1702,6 +1809,63 @@ struct Pipeline {
                 try? updated.write(to: URL(fileURLWithPath: path))
             }
         }
+    }
+
+    /// Give a Mac app a category when it doesn't declare one.
+    ///
+    /// Apple refuses a macOS upload whose Info.plist has no
+    /// `LSApplicationCategoryType` — error 90242, raised by `altool` only after
+    /// the archive, the signing and the export have all already succeeded.
+    /// Nothing earlier in the run mentions the key, and no iOS build ever needs
+    /// it, so a project that has only ever shipped from Xcode's organizer —
+    /// which writes the key from the target editor's Category popup — meets
+    /// this the first time it ships from here, minutes into a run.
+    ///
+    /// The value is a placeholder on purpose. A category is metadata: the one
+    /// customers see comes from the app's App Store Connect listing, and the
+    /// only thing the upload checks is that the key holds a category UTI. So a
+    /// missing key is filled rather than reported, and anything already shaped
+    /// like a category is left untouched — silently overwriting a deliberate
+    /// choice would be the worse failure of the two.
+    ///
+    /// Safe for the same reason `stampVersion` is: the archive is unsigned
+    /// until export signs it.
+    private func ensureAppCategory(inArchiveAt archive: String) {
+        guard input.platform == .macOS else { return }
+
+        let root = (archive as NSString).appendingPathComponent("Products/Applications")
+        let apps = archivedBundles(inArchiveAt: archive).filter {
+            ($0.bundle as NSString).deletingLastPathComponent == root
+        }
+        // `repairArchive` has already removed strays and proved one app is the
+        // host, so this resolves; prefer the id match anyway rather than assume.
+        guard let host = apps.first(where: { bundleIdentifier(atPlist: $0.plist) == input.bundleID })
+            ?? (apps.count == 1 ? apps.first : nil)
+        else { return }
+
+        var format = PropertyListSerialization.PropertyListFormat.xml
+        guard let data = FileManager.default.contents(atPath: host.plist),
+              var plist = try? PropertyListSerialization.propertyList(
+                  from: data, format: &format) as? [String: Any]
+        else { return }
+
+        // Deliberately a prefix test and not a list of Apple's categories:
+        // a checked-in list goes stale the day Apple adds one, and the stale
+        // branch is the damaging one — it would replace a valid new category
+        // with the placeholder. This rejects what is definitely not a category
+        // UTI (absent, empty, a bare "utilities") and trusts the rest.
+        let declared = (plist["LSApplicationCategoryType"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !declared.hasPrefix("public.app-category.") else { return }
+
+        let placeholder = "public.app-category.utilities"
+        plist["LSApplicationCategoryType"] = placeholder
+        guard let updated = try? PropertyListSerialization.data(
+            fromPropertyList: plist, format: format, options: 0) else { return }
+        try? updated.write(to: URL(fileURLWithPath: host.plist))
+
+        log("  No app category in Info.plist — set \(placeholder) so the upload is "
+            + "accepted. Your listing's real category is set in App Store Connect.\n")
     }
 
     // MARK: - Build

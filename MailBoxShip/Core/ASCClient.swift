@@ -309,16 +309,47 @@ struct ASCClient {
     /// A profile built from an App ID without it silently omits
     /// `aps-environment`, and push then fails at runtime with nothing in the
     /// build to explain why.
-    func enableCapability(_ capability: String, bundleIDResource: String) async {
-        _ = try? await request("POST", "/v1/bundleIdCapabilities", body: [
-            "data": [
-                "type": "bundleIdCapabilities",
-                "attributes": ["capabilityType": capability],
-                "relationships": [
-                    "bundleId": ["data": ["type": "bundleIds", "id": bundleIDResource]],
+    /// The capabilities an App ID already carries.
+    ///
+    /// Read before enabling anything, because Apple answers a capability that
+    /// is already on with a conflict — indistinguishable, from the caller's
+    /// side, from a refusal.
+    func capabilities(bundleIDResource: String) async -> Set<String> {
+        let json = try? await request(
+            "GET", "/v1/bundleIds/\(bundleIDResource)/bundleIdCapabilities?limit=200")
+        let items = json?["data"] as? [[String: Any]] ?? []
+        return Set(items.compactMap {
+            ($0["attributes"] as? [String: Any])?["capabilityType"] as? String
+        })
+    }
+
+    /// Turn one capability on. Returns `nil` on success, or Apple's reason.
+    ///
+    /// The reason is returned rather than thrown, and never discarded: a
+    /// capability that silently fails to be set produces a build whose profile
+    /// lacks the feature, and the failure then surfaces — much later, and
+    /// somewhere else entirely — as an archive error naming the profile, or as
+    /// a shipped app in which the feature is simply dead.
+    func enableCapability(_ capability: String, bundleIDResource: String) async -> String? {
+        var attributes: [String: Any] = ["capabilityType": capability]
+        // Some capabilities carry a second choice Apple will not default.
+        if let settings = Capabilities.settings[capability] {
+            attributes["settings"] = settings
+        }
+        do {
+            _ = try await request("POST", "/v1/bundleIdCapabilities", body: [
+                "data": [
+                    "type": "bundleIdCapabilities",
+                    "attributes": attributes,
+                    "relationships": [
+                        "bundleId": ["data": ["type": "bundleIds", "id": bundleIDResource]],
+                    ],
                 ],
-            ],
-        ])
+            ])
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
     }
 
     // MARK: - Certificates

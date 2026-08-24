@@ -575,7 +575,13 @@ final class ProfileStore: ObservableObject {
             out.append("That .p8 file no longer exists")
         }
         if p.keyID.isEmpty { out.append("Enter the Key ID") }
+        else if keyIDLooksWrong { out.append("The Key ID is 10 characters") }
+        // Enforced rather than hinted at: neither can authenticate, and the
+        // only other place they are judged is Apple's 401 — which names
+        // nothing, arrives after the account work has already started, and
+        // reads as a permissions problem with the key itself.
         if p.issuerID.isEmpty { out.append("Enter the Issuer ID") }
+        else if issuerLooksWrong { out.append("The Issuer ID is a UUID, not the Key ID") }
         return out
     }
 

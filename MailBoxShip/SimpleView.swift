@@ -21,6 +21,7 @@ struct SimpleView: View {
     @State private var team = ""
     @State private var copiedLog = false
     @State private var showSync = false
+    @State private var editingIssuer = false
     /// Checked once rather than per render — it is a handful of filesystem
     /// probes, and a view body is not the place for them.
     @State private var uploaderInstalled = true
@@ -57,6 +58,10 @@ struct SimpleView: View {
                     steps
                     if bothChosen { summary }
                     actions
+                    if let result = runner.result {
+                        ResultCard(result: result)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
                     if runner.isRunning || runner.finished || !runner.log.isEmpty { progress }
                 }
                 .frame(maxWidth: 560)
@@ -65,6 +70,7 @@ struct SimpleView: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .animation(.easeInOut(duration: 0.2), value: runner.result)
         .task(id: store.selectedID) {
             store.applyBakedProxyIfNeeded()
             uploaderInstalled = Transporter.isInstalled
@@ -93,6 +99,15 @@ struct SimpleView: View {
             Spacer()
 
             clientMenu
+
+            Button { Builds.open() } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "tray.full").font(.system(size: 10))
+                    Text("Builds").font(.system(size: 11))
+                }
+            }
+            .buttonStyle(.borderless)
+            .help("Open the folder every finished build is kept in")
 
             Button { showSync = true } label: {
                 HStack(spacing: 4) {
@@ -161,7 +176,8 @@ struct SimpleView: View {
             }
 
             stepCard(number: 2, title: "App Store Connect key",
-                     subtitle: "Drop the AuthKey_….p8 from any folder") {
+                     subtitle: "Drop the AuthKey_….p8 from any folder",
+                     footer: AnyView(issuerField)) {
                 PathField(path: p.keyPath, prompt: "Choose…",
                           types: [UTType(filenameExtension: "p8") ?? .data]) { chosen in
                     store.adoptKey(path: chosen)
@@ -173,6 +189,7 @@ struct SimpleView: View {
 
     private func stepCard<Content: View>(
         number: Int, title: String, subtitle: String,
+        footer: AnyView? = nil,
         @ViewBuilder content: () -> Content,
     ) -> some View {
         HStack(alignment: .top, spacing: 12) {
@@ -184,6 +201,10 @@ struct SimpleView: View {
                 Text(title).font(.system(size: 13, weight: .semibold))
                 content()
                 Text(subtitle).font(.system(size: 11)).foregroundStyle(.secondary)
+                if let footer {
+                    Divider().padding(.vertical, 1)
+                    footer
+                }
             }
         }
         .padding(14)
@@ -223,7 +244,6 @@ struct SimpleView: View {
             }
 
             platformRow
-            issuerRow
             uploaderRow
             if Deployment.proxyConfigured { proxyRow }
 
@@ -291,25 +311,74 @@ struct SimpleView: View {
         }
     }
 
-    /// Only asks for the issuer when nothing could resolve it — a known key, a
-    /// saved profile or the baked registry all skip this entirely.
-    @ViewBuilder private var issuerRow: some View {
-        if p.issuerID.isEmpty {
-            HStack(spacing: 8) {
-                Image(systemName: "questionmark.circle").font(.system(size: 11))
-                    .foregroundStyle(Design.warning)
-                TextField("Issuer ID (once — then remembered)",
-                          text: store.binding(\.issuerID))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12, design: .monospaced))
+    /// The issuer id, kept with the key it belongs to and always reachable.
+    ///
+    /// It resolves itself most of the time — from a known key, a saved profile
+    /// or the baked registry — which is why it used to appear only when it
+    /// could not. But one that resolved to the *wrong* account left nowhere to
+    /// correct it without crossing into the advanced screen, and a resolved
+    /// value you cannot see is one you cannot check. So it shows either way:
+    /// quiet when it is settled, a field the moment it is not.
+    @ViewBuilder private var issuerField: some View {
+        if p.issuerID.isEmpty || editingIssuer || store.issuerLooksWrong {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
+                    Image(systemName: p.issuerID.isEmpty ? "questionmark.circle" : "pencil")
+                        .font(.system(size: 11))
+                        .foregroundStyle(p.issuerID.isEmpty ? Design.warning : Color.secondary)
+                    TextField("Issuer ID — the UUID beside the key in App Store Connect",
+                              text: store.binding(\.issuerID))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                        .onSubmit { finishIssuer() }
+                    if p.issuerID.isEmpty {
+                        Pill(text: "Required", color: Design.warning)
+                    } else if store.issuerLooksWrong {
+                        Pill(text: "expects a UUID", color: Design.warning,
+                             symbol: "exclamationmark")
+                    } else {
+                        Button("Done") { finishIssuer() }
+                            .controlSize(.small)
+                            .keyboardShortcut(.defaultAction)
+                    }
+                }
+                // Nothing else on this screen says where to find it, and the
+                // commonest wrong answer — the Key ID, which is right there on
+                // the same page — is the one that fails as a bare 401.
+                if p.issuerID.isEmpty || store.issuerLooksWrong {
+                    Text("App Store Connect → Users and Access → Integrations. "
+                         + "It is the long UUID above the key list, the same for "
+                         + "every key on the account.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         } else {
             HStack(spacing: 6) {
                 Image(systemName: "checkmark.seal.fill").font(.system(size: 11))
                     .foregroundStyle(Design.success)
-                Text("Issuer resolved").font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(p.issuerID)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .help("Issuer ID")
+                Spacer(minLength: 6)
+                Button("Change") { editingIssuer = true }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    .disabled(runner.isRunning)
             }
         }
+    }
+
+    /// A changed issuer is a different account — re-read the team behind it, so
+    /// a wrong one is caught here rather than by a failed run.
+    private func finishIssuer() {
+        editingIssuer = false
+        Task { await fetchTeam() }
     }
 
     private var proxyRow: some View {

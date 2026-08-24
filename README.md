@@ -60,6 +60,13 @@ a Debug build is signed for devices and App Store Connect rejects it.
 Validation always runs before upload, because an upload permanently consumes a
 build number. Each upload needs a build number higher than the last.
 
+Either way the finished build is kept in `~/Developer/MailBoxShip`, filed by
+scheme and configuration and named with the version, build and time. When a run
+ends the screen says what it produced and how big it is, with **Show in Finder**,
+**Copy Path** and **All Builds** beside it — an uploaded build is still the one
+you will want to hand over or archive. **Builds** in the title bar opens the
+same folder at any time, including before anything has been run.
+
 ## Things that will bite you
 
 **The app record must already exist** in App Store Connect. The API cannot
@@ -69,6 +76,25 @@ create one; that is a web-UI step for the account owner.
 before requesting the profile, because a profile issued from an App ID without
 push silently omits `aps-environment` — the build uploads fine and push is
 simply dead, with nothing to explain why.
+
+**Capabilities come from your entitlements file — and from the App ID.**
+Whatever the target's `.entitlements` declares is turned on for the App ID
+before the profile is issued, because a profile inherits capabilities at
+creation and enabling one afterwards does nothing for it. Each one is reported
+individually; a capability Apple refuses is named, not glossed over.
+
+The reverse also happens, which matters for a target that has no entitlements
+file at all. A capability enabled on the App ID lands in the profile, but the
+profile only grants permission — the binary still has to claim the entitlement,
+and a target that never got a file claims nothing. Sign in with Apple is then
+enabled, the profile carries it, the build uploads cleanly, and the button
+fails on device with nothing to explain why. So capabilities that name nothing
+outside the app — Sign in with Apple, push, App Attest, Game Center and the
+like — are adopted from the profile, with the profile's own values, and each
+one is named in the log. App groups, iCloud containers and associated domains
+are not: those name specific external resources, and claiming a team's whole
+list because the profile carries it would sign the app for things it has no
+business claiming.
 
 **Automatic signing does not work with an API key.** Xcode's *cloud signing*
 service refuses these keys with "Cloud signing permission error", which reads

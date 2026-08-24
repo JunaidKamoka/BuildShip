@@ -133,3 +133,53 @@ struct PrimaryButton: View {
         .disabled(!enabled)
     }
 }
+
+/// A secondary action with an icon, sized to be seen and hit without aiming.
+///
+/// The borderless buttons elsewhere are right for options that sit beside a
+/// field. They are wrong for the things a person reaches for *after* a run —
+/// where is it, open the folder — which have to read as buttons from across
+/// the room, because at that moment they are the only thing being looked for.
+struct ActionButton: View {
+    let title: String
+    let symbol: String
+    var tint: Color = .primary
+    /// Carries the tint as its own fill: for the one action in a row that is
+    /// the obvious next move.
+    var prominent = false
+    var enabled = true
+    let action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: symbol).font(.system(size: 11, weight: .semibold))
+                Text(title).font(.system(size: 11, weight: .medium))
+            }
+            // Intrinsic width always. Squeezed into a row beside a long file
+            // name these otherwise collapse to "Show i…", which reads as broken
+            // rather than as tight — the name is the part that can be trimmed.
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 7)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(prominent
+                          ? tint.opacity(hovering ? 0.30 : 0.18)
+                          : Color.primary.opacity(hovering ? 0.13 : 0.07)),
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(prominent ? tint.opacity(0.40)
+                                            : Color.primary.opacity(0.10), lineWidth: 1),
+            )
+            .foregroundStyle(prominent ? tint : Color.primary)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.45)
+        .onHover { hovering = $0 && enabled }
+    }
+}
