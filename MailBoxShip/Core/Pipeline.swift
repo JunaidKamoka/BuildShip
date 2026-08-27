@@ -622,7 +622,27 @@ struct Pipeline {
 
         // An unreadable project is not evidence of a mismatch. Let the archive
         // report the real problem rather than blocking on a guess.
+        //
+        // A scheme the project does not contain is the exception: it is not a
+        // guess, it is the reason the settings could not be read at all, and it
+        // is the one unreadable case that is certainly wrong. It also cannot be
+        // left to the archive. Everything between here and there — App IDs,
+        // certificates, provisioning profiles, the build number claimed from
+        // App Store Connect — is created for `input.bundleID`, which at this
+        // point nothing has checked against this project. A profile repointed
+        // at a different project arrives here naming the previous app, and the
+        // archive's own error, when it finally comes, reports a missing scheme
+        // and says nothing about the account work already done under the wrong
+        // identifier.
         guard !info.bundleID.isEmpty else {
+            let (schemes, _) = await ProjectInspector.list(projectPath: input.projectPath)
+            if !schemes.isEmpty, !schemes.contains(input.scheme) {
+                let names = schemes.map { "“\($0)”" }.joined(separator: ", ")
+                throw ShipError(
+                    "This project has no scheme named \(input.scheme) — it builds "
+                    + "\(names). Choose the right scheme, or the project that builds "
+                    + "\(input.bundleID). Nothing was created on your account.")
+            }
             log("  Could not read the project's identifiers; continuing\n")
             return info
         }

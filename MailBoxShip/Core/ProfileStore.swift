@@ -539,9 +539,6 @@ final class ProfileStore: ObservableObject {
 
         let base = (path as NSString).lastPathComponent
             .replacingOccurrences(of: ".xcodeproj", with: "")
-        if profiles[selectedIndex].scheme.isEmpty {
-            profiles[selectedIndex].scheme = base
-        }
 
         // Version overrides belong to the app that was here before. Blank means
         // "use the project's own numbers", which is the only defensible start
@@ -554,11 +551,27 @@ final class ProfileStore: ObservableObject {
         // iOS choice behind, and a Mac project adopted afterwards is then
         // pinned to iOS by a picker the user last touched for another app.
         // Clearing both returns the profile to following detection.
+        //
+        // The scheme and the bundle id name the previous app outright, and are
+        // the pair this whole tool keys on. Left behind they do not read as
+        // leftovers — they read as a deliberate configuration, and no later
+        // stage can tell the difference: preflight compares the bundle id
+        // against whatever the stale scheme builds, so a stale scheme that
+        // happens to exist in the newly chosen project agrees with itself and
+        // uploads this project's binary into the other app's record. Clearing
+        // them hands both back to detection, which reads them from the project
+        // that is actually there.
         if replacesAnotherProject {
             profiles[selectedIndex].marketingVersion = ""
             profiles[selectedIndex].buildNumber = ""
             profiles[selectedIndex].platformRaw = ""
             profiles[selectedIndex].detectedPlatformRaw = ""
+            profiles[selectedIndex].scheme = ""
+            profiles[selectedIndex].bundleID = ""
+        }
+
+        if profiles[selectedIndex].scheme.isEmpty {
+            profiles[selectedIndex].scheme = base
         }
         if profiles[selectedIndex].name == "New profile" {
             profiles[selectedIndex].name = uniqueName(base)
