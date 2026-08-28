@@ -421,8 +421,8 @@ struct Pipeline {
             + "\(input.platform.displayName) app. Apple would accept the upload and then discard "
             + "the build, so nothing was built. A \(input.platform.displayName) app needs its own "
             + "record, and Apple will not let a second record reuse this bundle id — give the "
-            + "\(input.platform.displayName) target a different one. (Mac Catalyst is the "
-            + "exception that shares a record, and this tool does not build Catalyst yet.)"
+            + "\(input.platform.displayName) target a different one. (A Mac Catalyst build is "
+            + "the exception: it shares the iOS app's record, so ship it as Mac Catalyst.)"
         )
     }
 
@@ -663,11 +663,27 @@ struct Pipeline {
         // build that cannot happen. Only a scheme that demonstrably lists its
         // platforms and does not list this one objects: an unreadable setting is
         // not evidence, and a scheme supporting several leaves the choice alone.
-        let supported = (info.buildSettings[info.bundleID]?["SUPPORTED_PLATFORMS"] ?? "")
-            .lowercased()
-        if !supported.isEmpty, !supported.contains(input.platform.supportedPlatformName) {
-            let buildable = ShipPlatform.allCases
-                .filter { supported.contains($0.supportedPlatformName) }
+        //
+        // macOS and Mac Catalyst both answer "macosx" there, so the list alone
+        // cannot separate them and would wave through the one mistake that
+        // costs the most: a Catalyst app asked to ship as macOS archives
+        // perfectly and then dies at export, having already spent a
+        // certificate, an App ID and a profile. Whether a Mac build is Catalyst
+        // is a property of the target, and the target says so.
+        let targetSettings = info.buildSettings[info.bundleID] ?? [:]
+        let supported = (targetSettings["SUPPORTED_PLATFORMS"] ?? "").lowercased()
+        let isCatalyst = ["IS_MACCATALYST", "SUPPORTS_MACCATALYST"]
+            .contains { targetSettings[$0]?.uppercased() == "YES" }
+        func canBuild(_ platform: ShipPlatform) -> Bool {
+            guard supported.contains(platform.supportedPlatformName) else { return false }
+            switch platform {
+            case .iOS: return true
+            case .macOS: return !isCatalyst
+            case .macCatalyst: return isCatalyst
+            }
+        }
+        if !supported.isEmpty, !canBuild(input.platform) {
+            let buildable = ShipPlatform.allCases.filter(canBuild)
             throw ShipError(
                 "Scheme \(input.scheme) cannot build for \(input.platform.displayName)"
                 + (buildable.isEmpty ? "." : " — it builds for "
@@ -1374,6 +1390,30 @@ struct Pipeline {
         return Array(ids)
     }
 
+    /// What the Mac App Store requires of every executable it accepts, on top
+    /// of whatever the project declares for itself.
+    ///
+    /// The sandbox is the hard requirement: an upload whose app is not
+    /// sandboxed is refused outright ("App sandbox not enabled"). A Catalyst
+    /// build trips it every time — the key lives in an entitlements file, and
+    /// an iOS target has no reason to have ever written one, because iOS
+    /// sandboxes every app whether it asks to be or not.
+    ///
+    /// The other two are here because the sandbox on its own turns a working
+    /// app into a broken one. Sandboxed, an app reaches the network and the
+    /// files a person picks only by saying so, and neither failure is visible
+    /// from the outside: purchases never load, a chosen file is unreadable.
+    /// Both are things the app already had before the sandbox existed, so
+    /// granting them restores it rather than widening it.
+    ///
+    /// Only keys the project never mentions are filled. A declared value —
+    /// including a deliberate `false` — is left exactly as written.
+    private static let macAppStoreEntitlements: [String: Any] = [
+        "com.apple.security.app-sandbox": true,
+        "com.apple.security.network.client": true,
+        "com.apple.security.files.user-selected.read-write": true,
+    ]
+
     /// Embed each bundle's declared entitlements into the archive.
     ///
     /// Entitlements are written *by* codesign, and the archive is deliberately
@@ -1472,6 +1512,34 @@ struct Pipeline {
                     }
                 }
             }
+            // The Mac App Store refuses an unsandboxed app, and refuses it at
+            // the very end — altool raises it once the archive, the signing and
+            // the export have all already succeeded, minutes into a run.
+            if input.platform.isMacBundle, input.configuration == .release {
+                let missing = Self.macAppStoreEntitlements.filter {
+                    !(resolved?.keys.contains($0.key) ?? false)
+                }
+                if !missing.isEmpty {
+                    resolved = try Self.adding(
+                        missing, toEntitlementsAt: resolved?.file,
+                        stagedAs: identifier, in: work)
+                    for key in missing.keys.sorted() {
+                        log("  + \(identifier): added \(key) — required by the Mac App "
+                            + "Store and not declared by the target.\n")
+                    }
+                }
+
+                // Declared and switched off is a deliberate choice and it
+                // stands, but it is also the one value Apple will not take.
+                // Saying so here beats finding out after the upload starts.
+                if let file = resolved?.file,
+                   Self.entitlementFlag("com.apple.security.app-sandbox", at: file) == false {
+                    log("  ⚠︎ \(identifier): declares com.apple.security.app-sandbox as "
+                        + "false. The Mac App Store rejects that — set it to true to "
+                        + "upload.\n")
+                }
+            }
+
             guard let final = resolved, !final.keys.isEmpty else { continue }
             declared.append((path, identifier, final.file, final.keys))
         }
@@ -1622,6 +1690,15 @@ struct Pipeline {
             throw ShipError("Could not stage the adopted entitlements for \(identifier).")
         }
         return (destination, Set(plist.keys))
+    }
+
+    /// A boolean entitlement's declared value in a staged file, if it has one.
+    private static func entitlementFlag(_ key: String, at file: URL) -> Bool? {
+        guard let data = FileManager.default.contents(atPath: file.path),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, format: nil) as? [String: Any]
+        else { return nil }
+        return plist[key] as? Bool
     }
 
     /// Rewrite an entitlements file without the given keys.
@@ -1851,7 +1928,7 @@ struct Pipeline {
     /// Safe for the same reason `stampVersion` is: the archive is unsigned
     /// until export signs it.
     private func ensureAppCategory(inArchiveAt archive: String) {
-        guard input.platform == .macOS else { return }
+        guard input.platform.isMacBundle else { return }
 
         let root = (archive as NSString).appendingPathComponent("Products/Applications")
         let apps = archivedBundles(inArchiveAt: archive).filter {
@@ -1967,9 +2044,20 @@ struct Pipeline {
         // scheme that offers nothing for the platform being built is the case
         // worth explaining; anything else is a genuine destination problem and
         // keeps the generic message.
+        // macOS and Mac Catalyst are both announced as `platform:macOS`, and
+        // only Catalyst carries a variant, so the variant decides which of the
+        // two is being offered — naming the wrong one sends the user to a
+        // picker setting that fails the same way again.
+        let variant = output.contains("variant:Mac Catalyst")
         let offered = ShipPlatform.allCases.filter { candidate in
-            candidate != input.platform
-                && output.contains("platform:\(candidate.destinationName)")
+            guard candidate != input.platform,
+                  output.contains("platform:\(candidate.destinationName)")
+            else { return false }
+            switch candidate {
+            case .iOS: return true
+            case .macOS: return !variant
+            case .macCatalyst: return variant
+            }
         }
         guard let actual = offered.first else { return generic }
 
@@ -1980,7 +2068,7 @@ struct Pipeline {
 
     private func export(profiles: [String: String], team: String) async throws -> String {
         onStage(.export)
-        log("\n→ Exporting signed \(input.platform == .macOS ? "package" : "app")…\n")
+        log("\n→ Exporting signed \(input.platform.isMacBundle ? "package" : "app")…\n")
         let exportDir = work.appendingPathComponent("build/export")
 
         var options: [String: Any] = [
@@ -1997,7 +2085,7 @@ struct Pipeline {
             "manageAppVersionAndBuildNumber": false,
         ]
         if input.configuration == .release { options["uploadSymbols"] = true }
-        if input.platform == .macOS {
+        if input.platform.isMacBundle {
             // The Mac App Store package is signed by the installer identity;
             // without naming it here, manual export leaves the .pkg unsigned and
             // Apple rejects the upload.
@@ -2447,7 +2535,7 @@ extension ShipPlatform {
     var destinationName: String {
         switch self {
         case .iOS: "iOS"
-        case .macOS: "macOS"
+        case .macOS, .macCatalyst: "macOS"
         }
     }
 
@@ -2456,35 +2544,48 @@ extension ShipPlatform {
     var supportedPlatformName: String {
         switch self {
         case .iOS: "iphoneos"
-        case .macOS: "macosx"
+        case .macOS, .macCatalyst: "macosx"
         }
     }
 
     /// The `-destination` an archive is built for.
-    var archiveDestination: String { "generic/platform=\(destinationName)" }
+    ///
+    /// Catalyst names the variant explicitly. A scheme whose only Mac flavour
+    /// *is* Catalyst builds it from the bare macOS destination anyway, but one
+    /// that can build both would silently archive the native Mac app instead —
+    /// and the failure lands minutes later at export, on a profile mismatch
+    /// that says nothing about the destination.
+    var archiveDestination: String {
+        switch self {
+        case .iOS, .macOS: "generic/platform=\(destinationName)"
+        case .macCatalyst: "generic/platform=macOS,variant=Mac Catalyst"
+        }
+    }
 
     /// `altool`'s `-t` on validate and upload.
     var altoolType: String {
         switch self {
         case .iOS: "ios"
-        case .macOS: "macos"
+        case .macOS, .macCatalyst: "macos"
         }
     }
 
     /// What `-exportArchive` produces for the App Store: an `.ipa` on iOS, a
-    /// signed installer package on macOS.
+    /// signed installer package on macOS and Catalyst alike.
     var artifactSuffix: String {
         switch self {
         case .iOS: ".ipa"
-        case .macOS: ".pkg"
+        case .macOS, .macCatalyst: ".pkg"
         }
     }
 
-    /// App ID platform on the Developer portal.
+    /// App ID platform on the Developer portal. A Catalyst app is provisioned
+    /// against a Mac App ID, under the same identifier the iOS app uses unless
+    /// the target derives a `maccatalyst.`-prefixed one.
     var bundleIDPlatform: String {
         switch self {
         case .iOS: "IOS"
-        case .macOS: "MAC_OS"
+        case .macOS, .macCatalyst: "MAC_OS"
         }
     }
 
@@ -2495,7 +2596,7 @@ extension ShipPlatform {
     var storePlatform: String {
         switch self {
         case .iOS: "IOS"
-        case .macOS: "MAC_OS"
+        case .macOS, .macCatalyst: "MAC_OS"
         }
     }
 
@@ -2504,21 +2605,34 @@ extension ShipPlatform {
     var storeKind: String {
         switch self {
         case .iOS: "software"
-        case .macOS: "mac-software"
+        case .macOS, .macCatalyst: "mac-software"
         }
     }
 
     /// A Mac App Store package is signed by an installer certificate the app
-    /// build never touches; iOS has no equivalent.
-    var needsInstallerCertificate: Bool { self == .macOS }
+    /// build never touches; iOS has no equivalent. Catalyst ships the same
+    /// `.pkg` and needs the same identity.
+    var needsInstallerCertificate: Bool { self != .iOS }
+
+    /// Whether the shipped bundle is a Mac one: `X.app/Contents`, a `.pkg`
+    /// signed by an installer identity, and an `LSApplicationCategoryType` the
+    /// upload refuses to go without. True for Catalyst, which is a Mac app in
+    /// every respect that reaches this pipeline.
+    var isMacBundle: Bool { self != .iOS }
 
     /// The App Store provisioning profile type for a configuration.
+    ///
+    /// Catalyst has its own pair. Handing export a `MAC_APP_STORE` profile for
+    /// a Catalyst archive fails with "is not a Mac Catalyst App Store profile",
+    /// after the archive, the certificates and the App ID have all been made.
     func profileType(_ configuration: Pipeline.Configuration) -> String {
         switch (self, configuration) {
         case (.iOS, .release): "IOS_APP_STORE"
         case (.iOS, .debug): "IOS_APP_DEVELOPMENT"
         case (.macOS, .release): "MAC_APP_STORE"
         case (.macOS, .debug): "MAC_APP_DEVELOPMENT"
+        case (.macCatalyst, .release): "MAC_CATALYST_APP_STORE"
+        case (.macCatalyst, .debug): "MAC_CATALYST_APP_DEVELOPMENT"
         }
     }
 }

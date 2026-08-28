@@ -9,6 +9,12 @@ import Foundation
 enum ShipPlatform: String, Sendable, CaseIterable, Identifiable {
     case iOS
     case macOS
+    /// An iOS app built for the Mac. It is neither of the other two: it archives
+    /// from the iOS target against the macOS SDK, ships as a `.pkg` like a Mac
+    /// app, and needs its own `MAC_CATALYST_APP_STORE` profile type — a Mac App
+    /// Store profile is refused at export ("is not a Mac Catalyst App Store
+    /// profile"), which is the failure this case exists to prevent.
+    case macCatalyst
 
     var id: String { rawValue }
 
@@ -17,6 +23,7 @@ enum ShipPlatform: String, Sendable, CaseIterable, Identifiable {
         switch self {
         case .iOS: "iOS"
         case .macOS: "macOS"
+        case .macCatalyst: "Mac Catalyst"
         }
     }
 
@@ -25,6 +32,7 @@ enum ShipPlatform: String, Sendable, CaseIterable, Identifiable {
         switch self {
         case .iOS: "iphone"
         case .macOS: "desktopcomputer"
+        case .macCatalyst: "macwindow"
         }
     }
 }
@@ -288,11 +296,22 @@ enum ProjectInspector {
                 // mention of macOS as proof would ship every such app as a Mac
                 // app. It stays as the fallback witness for the projects that
                 // leave SDKROOT unset.
+                //
+                // A Mac build is then either native or Catalyst, and the two
+                // need different profiles. IS_MACCATALYST is Xcode's own answer
+                // to that question, resolved for this scheme, and it is the only
+                // reliable one: a Catalyst target reports the macOS SDK and
+                // lists "macosx" among its supported platforms exactly as a
+                // native Mac app does, so without it the two are
+                // indistinguishable and a Catalyst app gets a Mac App Store
+                // profile that export refuses.
                 let sdk = (settings["SDKROOT"] as? String ?? "").lowercased()
                 let platforms = (settings["SUPPORTED_PLATFORMS"] as? String ?? "").lowercased()
-                if sdk.contains("macosx") { info.platform = .macOS }
+                let catalyst = (settings["IS_MACCATALYST"] as? String)?.uppercased() == "YES"
+                let mac: ShipPlatform = catalyst ? .macCatalyst : .macOS
+                if sdk.contains("macosx") { info.platform = mac }
                 else if sdk.contains("iphoneos") { info.platform = .iOS }
-                else if platforms.contains("macosx") { info.platform = .macOS }
+                else if platforms.contains("macosx") { info.platform = mac }
                 else if platforms.contains("iphoneos") { info.platform = .iOS }
             } else if !info.extensionBundleIDs.contains(bundle) {
                 info.extensionBundleIDs.append(bundle)
