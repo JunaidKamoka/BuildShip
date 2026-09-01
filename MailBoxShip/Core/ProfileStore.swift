@@ -573,10 +573,29 @@ final class ProfileStore: ObservableObject {
         if profiles[selectedIndex].scheme.isEmpty {
             profiles[selectedIndex].scheme = base
         }
-        if profiles[selectedIndex].name == "New profile" {
+        // Adopt the project's name only while the profile still carries the
+        // placeholder the user never chose. `addProfile` mints "New profile 2",
+        // "New profile 11", … so an exact match against "New profile" leaves
+        // every store past the first stuck on its number even after a project
+        // is chosen — which is exactly the "New profile 11" the dropdown fills
+        // up with. Match the whole default family, but never a name the user
+        // has actually typed.
+        if isDefaultName(profiles[selectedIndex].name) {
             profiles[selectedIndex].name = uniqueName(base)
         }
         scheduleSave()
+    }
+
+    /// True for the untouched placeholder in any of its forms — "New profile"
+    /// and the numbered "New profile 2" / "New profile 11" that `uniqueName`
+    /// produces for additional stores. Anything the user has renamed to falls
+    /// through, so adopting a project never overwrites a chosen name.
+    private func isDefaultName(_ name: String) -> Bool {
+        if name == "New profile" { return true }
+        let prefix = "New profile "
+        guard name.hasPrefix(prefix) else { return false }
+        let rest = name.dropFirst(prefix.count)
+        return !rest.isEmpty && rest.allSatisfy(\.isNumber)
     }
 
     // MARK: - Validation
