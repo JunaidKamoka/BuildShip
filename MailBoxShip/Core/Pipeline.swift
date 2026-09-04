@@ -1529,14 +1529,23 @@ struct Pipeline {
                     }
                 }
 
-                // Declared and switched off is a deliberate choice and it
-                // stands, but it is also the one value Apple will not take.
-                // Saying so here beats finding out after the upload starts.
+                // A declared `false` is the one value Apple will not take: the
+                // Mac App Store refuses an unsandboxed app outright ("App
+                // sandbox not enabled"), and it refuses it at the very end,
+                // minutes into a run after the archive, signing and export have
+                // all succeeded. Leaving it as written only defers that failure,
+                // and there is no shippable form of the app in which the key is
+                // false — so flip it to true here rather than warn. This is a
+                // repair of the one setting the store mandates, not a change of
+                // the target's intent; the ad-hoc carrier is overwritten at
+                // export, and this value is what the shipped app ends up with.
                 if let file = resolved?.file,
                    Self.entitlementFlag("com.apple.security.app-sandbox", at: file) == false {
-                    log("  ⚠︎ \(identifier): declares com.apple.security.app-sandbox as "
-                        + "false. The Mac App Store rejects that — set it to true to "
-                        + "upload.\n")
+                    resolved = try Self.adding(
+                        ["com.apple.security.app-sandbox": true], toEntitlementsAt: file,
+                        stagedAs: identifier, in: work)
+                    log("  + \(identifier): com.apple.security.app-sandbox was declared "
+                        + "false — set to true, which the Mac App Store requires.\n")
                 }
             }
 
