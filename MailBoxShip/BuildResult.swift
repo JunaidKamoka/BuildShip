@@ -9,7 +9,7 @@ import AppKit
 /// multi-thousand-line archive log. Holding the path here lets the finish state
 /// hand it over directly instead.
 struct BuildResult: Equatable {
-    /// Absolute path of the `.ipa` (or `.pkg`) the run produced.
+    /// Absolute path of the `.ipa`, `.pkg` or `.app` the run produced.
     let path: String
     /// Whether it also reached App Store Connect.
     let uploaded: Bool
@@ -20,10 +20,48 @@ struct BuildResult: Equatable {
     init(path: String, uploaded: Bool) {
         self.path = path
         self.uploaded = uploaded
-        let bytes = try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64
-        self.size = (bytes ?? nil).map {
+        self.size = Self.byteCount(atPath: path).map {
             ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
         } ?? ""
+    }
+
+    /// Total bytes at `path`, walking into it when it is a bundle.
+    ///
+    /// An `.ipa` or `.pkg` is a single file and `attributesOfItem` answers for
+    /// it directly. A macOS `.app` is a *directory*, and that same call returns
+    /// the size of the directory entry rather than of its contents — 96 bytes
+    /// for every Mac app ever built, however large. The figure was not so much
+    /// wrong as meaningless, and it sat next to "Build ready" reading like a
+    /// failed export.
+    ///
+    /// So walk the bundle instead. `totalFileAllocatedSize` is the on-disk
+    /// figure, with `fileAllocatedSize` behind it for the filesystems that do
+    /// not report the total, and only regular files count: directories would
+    /// otherwise add their own entries back into the sum.
+    private static func byteCount(atPath path: String) -> Int64? {
+        let manager = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard manager.fileExists(atPath: path, isDirectory: &isDirectory) else { return nil }
+
+        guard isDirectory.boolValue else {
+            return (try? manager.attributesOfItem(atPath: path))?[.size] as? Int64
+        }
+
+        let keys: Set<URLResourceKey> = [
+            .isRegularFileKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey,
+        ]
+        guard let files = manager.enumerator(
+            at: URL(fileURLWithPath: path), includingPropertiesForKeys: Array(keys))
+        else { return nil }
+
+        var total: Int64 = 0
+        for case let file as URL in files {
+            guard let values = try? file.resourceValues(forKeys: keys),
+                  values.isRegularFile == true
+            else { continue }
+            total += Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
+        }
+        return total
     }
 
     var url: URL { URL(fileURLWithPath: path) }

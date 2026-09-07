@@ -226,25 +226,23 @@ enum ProjectInspector {
 
     /// Everything else, from the resolved build settings of one scheme.
     ///
-    /// `-showBuildSettings` returns one entry per target in the scheme, which
-    /// is what makes the extension bundle ids discoverable — they are simply
-    /// the non-application targets. Parsing the `.pbxproj` by hand would find
-    /// the same strings but could not tell which target they belonged to, nor
-    /// resolve `$(...)` variables.
+    /// `-showBuildSettings` returns one entry per target the scheme's build
+    /// action names, which is what makes the extension bundle ids discoverable
+    /// — they are simply the non-application targets. Parsing the `.pbxproj` by
+    /// hand would find the same strings but could not tell which target they
+    /// belonged to, nor resolve `$(...)` variables.
+    ///
+    /// What the scheme names is not always every target that ships, though, so
+    /// the leftovers are asked for separately below.
     static func inspect(projectPath: String, scheme: String) async -> Info {
         var info = Info()
 
-        let result = await Shell.run("/usr/bin/xcodebuild",
-            container(forProjectPath: projectPath).arguments + [
-            "-scheme", scheme,
-            // Release: the configuration that actually ships, and the one whose
-            // version numbers matter.
-            "-configuration", "Release",
-            "-showBuildSettings", "-json",
-        ])
+        var entries = await buildSettings(
+            container: container(forProjectPath: projectPath).arguments,
+            selecting: ["-scheme", scheme])
+        entries += await settingsForTargetsMissing(from: entries, projectPath: projectPath)
 
-        guard let entries = firstJSON(in: result.output, opening: "[") as? [[String: Any]]
-        else { return info }
+        guard !entries.isEmpty else { return info }
 
         for entry in entries {
             guard let settings = entry["buildSettings"] as? [String: Any] else { continue }
@@ -328,6 +326,114 @@ enum ProjectInspector {
         if info.buildNumber.contains("$") { info.buildNumber = "" }
 
         return info
+    }
+
+    /// `-showBuildSettings -json`, decoded, for whatever selects the targets.
+    private static func buildSettings(
+        container: [String], selecting arguments: [String],
+    ) async -> [[String: Any]] {
+        let result = await Shell.run("/usr/bin/xcodebuild", container + arguments + [
+            // Release: the configuration that actually ships, and the one whose
+            // version numbers matter.
+            "-configuration", "Release",
+            "-showBuildSettings", "-json",
+        ])
+        return firstJSON(in: result.output, opening: "[") as? [[String: Any]] ?? []
+    }
+
+    /// Settings for the project's targets that the scheme never reported.
+    ///
+    /// A scheme answers for the targets its build action names, and that need
+    /// not be all of them. An app extension is usually embedded through a copy
+    /// phase and built as an *implicit dependency*, so a Safari extension, a
+    /// widget or a share extension can be absent from the scheme's answer while
+    /// very much being inside the shipped app.
+    ///
+    /// Absent here meant absent from `entitlements`, and an extension whose
+    /// entitlements are unknown gets signed with only the identifiers codesign
+    /// takes from the profile: App Sandbox and the app group are dropped. Apple
+    /// does not catch it, because the *app* is sandboxed and the app is what
+    /// validation looks at. It surfaces at runtime instead, as an extension that
+    /// loads and then cannot reach anything it shares with its container.
+    ///
+    /// Asked per target, and only for targets the scheme did not cover, so the
+    /// usual project — whose scheme does name everything — adds nothing beyond
+    /// one cheap read of `project.pbxproj`.
+    private static func settingsForTargetsMissing(
+        from entries: [[String: Any]], projectPath: String,
+    ) async -> [[String: Any]] {
+        let covered = Set(entries.compactMap { $0["target"] as? String })
+        let missing = await projectTargets(projectPath: projectPath)
+            .filter { !covered.contains($0) }
+        guard !missing.isEmpty else { return [] }
+
+        // Concurrently, because each call is a whole `xcodebuild` that resolves
+        // the package graph again — eight seconds on a project with a dozen SPM
+        // dependencies — and an app with a widget, a share extension and a
+        // notification extension would otherwise pay that three times in a row.
+        return await withTaskGroup(of: (offset: Int, entries: [[String: Any]]).self) { group in
+            for (offset, target) in missing.enumerated() {
+                group.addTask {
+                    // `-target` is a project-level selector and is not valid
+                    // against a workspace, so address the `.xcodeproj` directly
+                    // even where one exists. A target that cannot be resolved
+                    // that way — a Pods target needing the workspace, say —
+                    // simply yields nothing, and the caller already skips the
+                    // CocoaPods and framework ids anyway.
+                    (offset, await buildSettings(
+                        container: ["-project", projectPath],
+                        selecting: ["-target", target]))
+                }
+            }
+
+            // Restored to the order the targets were asked in, rather than the
+            // order the calls happened to finish: `extensionBundleIDs` is built
+            // from this and reordering it every run would make detection look
+            // unstable to anyone watching it.
+            var collected: [(offset: Int, entries: [[String: Any]])] = []
+            for await result in group { collected.append(result) }
+            return collected.sorted { $0.offset < $1.offset }.flatMap(\.entries)
+        }
+    }
+
+    /// The names of the targets belonging to the `.xcodeproj` itself.
+    ///
+    /// Read straight out of `project.pbxproj`, which is an OpenStep property
+    /// list that Foundation parses natively. `xcodebuild -list` answers the
+    /// same question authoritatively, but it resolves the package graph first
+    /// and costs about nine seconds on a project with a dozen SPM dependencies
+    /// — for a list of names that is sitting in a file. It stays as the
+    /// fallback, so an unreadable or reformatted `.pbxproj` costs speed rather
+    /// than correctness.
+    ///
+    /// Names taken this way are only *candidates*: each is handed to
+    /// `-showBuildSettings -target`, which resolves it properly or reports
+    /// nothing, so a stale name here cannot put wrong settings into `Info`.
+    /// `PBXNativeTarget` is the filter because aggregate and legacy targets
+    /// build no bundle, and a CocoaPods workspace keeps its own targets in a
+    /// separate `Pods.xcodeproj` that this never reads.
+    ///
+    /// The fallback asks the project directly rather than through
+    /// `container(forProjectPath:)`: `list` answers through the workspace
+    /// wherever there is one, and a workspace carries no targets of its own.
+    private static func projectTargets(projectPath: String) async -> [String] {
+        let pbxproj = (projectPath as NSString).appendingPathComponent("project.pbxproj")
+        if let data = FileManager.default.contents(atPath: pbxproj),
+           let plist = try? PropertyListSerialization.propertyList(
+               from: data, options: [], format: nil) as? [String: Any],
+           let objects = plist["objects"] as? [String: Any] {
+            let names = objects.values.compactMap { $0 as? [String: Any] }
+                .filter { $0["isa"] as? String == "PBXNativeTarget" }
+                .compactMap { $0["name"] as? String }
+            if !names.isEmpty { return names }
+        }
+
+        let result = await Shell.run(
+            "/usr/bin/xcodebuild", ["-project", projectPath, "-list", "-json"])
+        guard let json = firstJSON(in: result.output, opening: "{") as? [String: Any],
+              let project = json["project"] as? [String: Any]
+        else { return [] }
+        return project["targets"] as? [String] ?? []
     }
 
     /// The entitlements Xcode would generate, written out as a file.

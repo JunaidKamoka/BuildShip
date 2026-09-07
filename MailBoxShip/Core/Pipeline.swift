@@ -753,10 +753,30 @@ struct Pipeline {
         // which is unusable for several apps built repeatedly. The identity is
         // checked against the account rather than trusted, because one revoked
         // elsewhere would import fine and then fail at signing.
-        if !input.identityPath.isEmpty,
-           FileManager.default.fileExists(atPath: input.identityPath) {
-            let live = (try? await client.certificates(type: type)) ?? []
-            let serial = await Self.serial(ofP12: input.identityPath)
+        // Two candidates, because the profile stores one identity path and a
+        // run needs the one matching its own certificate type: a Debug run
+        // signs with a development certificate and a Release run with a
+        // distribution one. Looking only at the stored path makes the other
+        // type invisible, so it is minted again on every run of the other
+        // configuration — straight into Apple's cap of two, and a revocation
+        // of somebody else's certificate to get under it.
+        var attempted: Set<String> = []
+        var found: [ASCClient.Certificate]?
+        for candidate in [
+            input.identityPath,
+            Self.identityDestination(near: input.keyPath, team: team, type: type),
+        ] {
+            guard !candidate.isEmpty, attempted.insert(candidate).inserted,
+                  FileManager.default.fileExists(atPath: candidate) else { continue }
+
+            let live: [ASCClient.Certificate]
+            if let cached = found {
+                live = cached
+            } else {
+                live = try await client.certificates(type: type)
+                found = live
+            }
+            let serial = await Self.serial(ofP12: candidate)
 
             // Compared with leading zeros stripped. OpenSSL prints a serial
             // with them, Apple's API returns it without — so an exact string
@@ -768,11 +788,14 @@ struct Pipeline {
                    Self.normalisedSerial($0.serialNumber) == Self.normalisedSerial(serial)
                }) {
                 try await keychain.importIdentity(
-                    p12Path: input.identityPath, p12Password: Self.identityPassphrase)
-                log("  Reusing identity from \((input.identityPath as NSString).lastPathComponent)\n")
+                    p12Path: candidate, p12Password: Self.identityPassphrase)
+                log("  Reusing identity from \((candidate as NSString).lastPathComponent)\n")
                 return match
             }
-            log("  That identity is no longer valid on the account; requesting a new one\n")
+        }
+        if !attempted.isEmpty {
+            log("  No \(type.lowercased()) identity on this machine is still valid on the "
+                + "account; requesting a new one\n")
         }
 
         let keyPath = work.appendingPathComponent("signing.key").path
@@ -808,7 +831,12 @@ struct Pipeline {
         try? FileManager.default.removeItem(atPath: destination)
         try? FileManager.default.copyItem(atPath: scratchP12, toPath: destination)
         log("  Saved identity → \(destination)\n")
-        onIdentityCreated(destination)
+        // Only the distribution identity is reported back: that is the one the
+        // profile stores and shows. A development identity from a Debug run
+        // would replace it there and leave the next Release run naming a
+        // certificate of the wrong type. It is still saved beside the key,
+        // which is where the reuse above looks for it.
+        if type == "DISTRIBUTION" { onIdentityCreated(destination) }
 
         return certificate
     }
