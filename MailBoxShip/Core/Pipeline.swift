@@ -29,6 +29,10 @@ struct Pipeline {
         var signingCertificate: String {
             self == .release ? "Apple Distribution" : "Apple Development"
         }
+
+        /// A development profile names the machines it is valid on; a store
+        /// profile must carry no devices at all.
+        var profileNeedsDevices: Bool { self == .debug }
     }
 
     struct Input {
@@ -174,6 +178,9 @@ struct Pipeline {
         /// The downloaded provisioning profile per bundle id, for embedding
         /// into iOS bundles before export.
         var profileFiles: [String: URL]
+        /// Devices every development profile in this run is scoped to. Empty on
+        /// a Release run, where a profile must not name any.
+        let deviceIDs: [String]
     }
 
     /// Build a signed .ipa and return its path.
@@ -219,22 +226,23 @@ struct Pipeline {
         // A Mac App Store package is signed by a second, installer identity —
         // the app inside is signed by the Apple Distribution certificate above,
         // exactly as on iOS.
-        let installerCertificate = input.platform.needsInstallerCertificate
+        let installerCertificate = input.platform.needsInstallerCertificate(input.configuration)
             ? try await prepareInstallerCertificate(client: client, keychain: keychain, team: team)
             : nil
 
         var renames: [String: String] = [:]
         var profileFiles: [String: URL] = [:]
+        var deviceIDs: [String] = []
         let profiles = try await prepareProfiles(
             client: client, team: team, certificate: certificate, renames: &renames,
-            profileFiles: &profileFiles)
+            profileFiles: &profileFiles, devices: &deviceIDs)
 
         return BuildContext(
             client: client, team: team, certificate: certificate,
             installerCertificate: installerCertificate, profiles: profiles,
             projectInfo: projectInfo, bundleIDRenames: renames,
             signingIdentity: await Self.codesigningIdentityHash(inKeychainAt: keychain.path),
-            profileFiles: profileFiles)
+            profileFiles: profileFiles, deviceIDs: deviceIDs)
     }
 
     /// The one codesigning identity the ephemeral keychain holds, by SHA-1 —
@@ -273,7 +281,8 @@ struct Pipeline {
         var extraEntitlements: [String: String] = [:]
         let complete = try await coverEmbeddedProfiles(
             prepared: context.profiles, client: context.client,
-            team: context.team, certificate: context.certificate, renames: &renames,
+            team: context.team, certificate: context.certificate,
+            devices: context.deviceIDs, renames: &renames,
             profileFiles: &profileFiles, extraEntitlements: &extraEntitlements)
 
         // Plist edits stay ahead of signing: the renames rewrite Info.plist,
@@ -1004,12 +1013,100 @@ struct Pipeline {
             .appendingPathComponent("Library/MobileDevice/Provisioning Profiles", isDirectory: true)
     }
 
+    /// Apple caps a profile's device list; past it the create is rejected
+    /// outright rather than truncated.
+    private static let profileDeviceLimit = 100
+
+    /// The devices a development profile in this run has to name.
+    ///
+    /// Development signing is per-machine, so Apple requires the relationship
+    /// and answers its absence with 409 "The relationship 'devices' is required
+    /// but was not provided" — a message about the request, for what is really
+    /// an empty Devices list on the account. Empty for Release, where naming a
+    /// device is itself an error.
+    ///
+    /// A Mac run can fix the empty case by itself: the machine that needs to be
+    /// in the profile is the one running the build, and its UDID is readable
+    /// here. An iPhone is not attached to this process in any reliable way, so
+    /// that case says which list to add it to instead.
+    private func developmentDevices(client: ASCClient) async throws -> [String] {
+        guard input.configuration.profileNeedsDevices else { return [] }
+
+        // The portal's device platform is spelled the same as an App ID's.
+        let platform = input.platform.bundleIDPlatform
+        let registered = try await client.devices()
+        var usable = registered.filter { $0.platform == platform && $0.isEnabled }
+
+        if input.platform.isMacBundle, let udid = await Self.provisioningUDID() {
+            if let mine = usable.first(where: { $0.udid == udid }) {
+                // First in the list: it is trimmed to Apple's cap below, and
+                // the machine doing the building is the one entry that must
+                // survive the trim.
+                usable.removeAll { $0.id == mine.id }
+                usable.insert(mine, at: 0)
+            } else if let disabled = registered.first(where: { $0.udid == udid }) {
+                throw ShipError(
+                    "This Mac is registered on the account as \u{201C}\(disabled.name)\u{201D} "
+                    + "but is disabled, so no development profile can include it. Re-enable "
+                    + "it at developer.apple.com → Devices, or build Release instead.")
+            } else {
+                let added = try await client.registerDevice(
+                    name: Host.current().localizedName ?? "Mac",
+                    udid: udid, platform: platform)
+                log("  Registered this Mac for development: \(added.name) — \(added.udid)\n")
+                usable.removeAll { $0.id == added.id }
+                usable.insert(added, at: 0)
+            }
+        }
+
+        let kind = platform == "IOS" ? "iOS device" : "Mac"
+        guard !usable.isEmpty else {
+            throw ShipError(
+                "A development profile has to name at least one device, and this account "
+                + "has no enabled \(kind) registered. Add one at developer.apple.com → "
+                + "Devices — a device's identifier is in Xcode → Window → Devices and "
+                + "Simulators — or build Release, which needs no devices at all.")
+        }
+
+        let scoped = Array(usable.prefix(Self.profileDeviceLimit))
+        log("  Devices: \(scoped.count) \(kind)\(scoped.count == 1 ? "" : "s")\n")
+        return scoped.map(\.id)
+    }
+
+    /// This Mac's Provisioning UDID — how the Developer portal identifies a Mac.
+    ///
+    /// Not the Hardware UUID. On Apple silicon the two differ, and a device
+    /// registered under the hardware UUID yields a profile Apple issues happily
+    /// and the machine then fails to match, which surfaces much later as an
+    /// unsigned-launch failure rather than as a bad registration. On Intel there
+    /// is no separate line and the hardware UUID *is* the provisioning one.
+    private static func provisioningUDID() async -> String? {
+        let result = await Shell.run("/usr/sbin/system_profiler", ["SPHardwareDataType"])
+        for key in ["Provisioning UDID", "Hardware UUID"] {
+            guard let line = result.output
+                .split(separator: "\n")
+                .first(where: { $0.contains("\(key):") })
+            else { continue }
+            let value = line.split(separator: ":", maxSplits: 1)
+                .last?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+            if !value.isEmpty { return value.uppercased() }
+        }
+        return nil
+    }
+
     private func prepareProfiles(
         client: ASCClient, team: String, certificate: ASCClient.Certificate,
         renames: inout [String: String], profileFiles: inout [String: URL],
+        devices: inout [String],
     ) async throws -> [String: String] {
         onStage(.profiles)
         log("→ Preparing provisioning profiles…\n")
+
+        // Resolved once for the whole run: every profile it issues names the
+        // same machines, and registering this Mac twice would be pointless
+        // traffic against the account.
+        devices = try await developmentDevices(client: client)
 
         let profileDir = profileDirectory
         try FileManager.default.createDirectory(at: profileDir, withIntermediateDirectories: true)
@@ -1020,7 +1117,7 @@ struct Pipeline {
                 for: identifier, client: client, team: team, certificate: certificate,
                 profileDir: profileDir,
                 entitlementsPath: input.entitlementsPath(for: identifier),
-                renames: &renames)
+                devices: devices, renames: &renames)
             mapping[prepared.identifier] = prepared.profileName
             if let file = prepared.profileFile { profileFiles[prepared.identifier] = file }
         }
@@ -1085,7 +1182,7 @@ struct Pipeline {
     private func prepareProfile(
         for requested: String, client: ASCClient, team: String,
         certificate: ASCClient.Certificate, profileDir: URL, entitlementsPath: String,
-        renames: inout [String: String],
+        devices: [String], renames: inout [String: String],
     ) async throws -> (identifier: String, profileName: String, profileFile: URL?) {
         let (identifier, resource) = try await registeredBundleID(
             for: requested, client: client, team: team, renames: &renames)
@@ -1111,6 +1208,7 @@ struct Pipeline {
             type: input.platform.profileType(input.configuration),
             bundleIDResource: resource,
             certificateID: certificate.id,
+            deviceIDs: devices,
         )
 
         var file: URL?
@@ -1267,7 +1365,8 @@ struct Pipeline {
 
     private func coverEmbeddedProfiles(
         prepared: [String: String], client: ASCClient, team: String,
-        certificate: ASCClient.Certificate, renames: inout [String: String],
+        certificate: ASCClient.Certificate, devices: [String],
+        renames: inout [String: String],
         profileFiles: inout [String: URL], extraEntitlements: inout [String: String],
     ) async throws -> [String: String] {
         let embedded = embeddedBundleIDs(inArchiveAt: archivePath)
@@ -1304,7 +1403,7 @@ struct Pipeline {
                 profileDir: profileDir,
                 entitlementsPath: entitlements[identifier]
                     ?? input.entitlementsPath(for: identifier),
-                renames: &renames)
+                devices: devices, renames: &renames)
             mapping[prepared.identifier] = prepared.profileName
             if let file = prepared.profileFile { profileFiles[prepared.identifier] = file }
         }
@@ -2077,7 +2176,8 @@ struct Pipeline {
 
     private func export(profiles: [String: String], team: String) async throws -> String {
         onStage(.export)
-        log("\n→ Exporting signed \(input.platform.isMacBundle ? "package" : "app")…\n")
+        let exportsPackage = input.platform.isMacBundle && input.configuration == .release
+        log("\n→ Exporting signed \(exportsPackage ? "package" : "app")…\n")
         let exportDir = work.appendingPathComponent("build/export")
 
         var options: [String: Any] = [
@@ -2094,10 +2194,11 @@ struct Pipeline {
             "manageAppVersionAndBuildNumber": false,
         ]
         if input.configuration == .release { options["uploadSymbols"] = true }
-        if input.platform.isMacBundle {
+        if exportsPackage {
             // The Mac App Store package is signed by the installer identity;
             // without naming it here, manual export leaves the .pkg unsigned and
-            // Apple rejects the upload.
+            // Apple rejects the upload. A development export has no package, and
+            // naming an identity for one it will not produce is an export error.
             options["installerSigningCertificate"] = "3rd Party Mac Developer Installer"
         }
 
@@ -2117,7 +2218,7 @@ struct Pipeline {
         guard result.succeeded else { throw ShipError("Export failed. See the log above.") }
 
         let contents = try FileManager.default.contentsOfDirectory(atPath: exportDir.path)
-        let suffix = input.platform.artifactSuffix
+        let suffix = input.platform.artifactSuffix(input.configuration)
         guard let artifact = contents.first(where: { $0.hasSuffix(suffix) }) else {
             throw ShipError("Export reported success but produced no \(suffix)")
         }
@@ -2199,7 +2300,8 @@ struct Pipeline {
         var name = Self.pathSafe(input.scheme)
         if !version.isEmpty { name += "-\(version)" }
         if !build.isEmpty { name += "-b\(build)" }
-        name += "-\(input.configuration.rawValue)-\(stamp.string(from: Date()))\(input.platform.artifactSuffix)"
+        name += "-\(input.configuration.rawValue)-\(stamp.string(from: Date()))"
+            + input.platform.artifactSuffix(input.configuration)
         return name
     }
 
@@ -2581,10 +2683,12 @@ extension ShipPlatform {
 
     /// What `-exportArchive` produces for the App Store: an `.ipa` on iOS, a
     /// signed installer package on macOS and Catalyst alike.
-    var artifactSuffix: String {
+    func artifactSuffix(_ configuration: Pipeline.Configuration) -> String {
         switch self {
         case .iOS: ".ipa"
-        case .macOS, .macCatalyst: ".pkg"
+        // A development export of a Mac app is the `.app` itself: there is no
+        // package, because a development build is run rather than submitted.
+        case .macOS, .macCatalyst: configuration == .release ? ".pkg" : ".app"
         }
     }
 
@@ -2621,7 +2725,13 @@ extension ShipPlatform {
     /// A Mac App Store package is signed by an installer certificate the app
     /// build never touches; iOS has no equivalent. Catalyst ships the same
     /// `.pkg` and needs the same identity.
-    var needsInstallerCertificate: Bool { self != .iOS }
+    ///
+    /// Release only. A development run exports no package, so asking Apple for
+    /// an installer certificate there spends one of the account's two against
+    /// something nothing will sign.
+    func needsInstallerCertificate(_ configuration: Pipeline.Configuration) -> Bool {
+        self != .iOS && configuration == .release
+    }
 
     /// Whether the shipped bundle is a Mac one: `X.app/Contents`, a `.pkg`
     /// signed by an installer identity, and an `LSApplicationCategoryType` the

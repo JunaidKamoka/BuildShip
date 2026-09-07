@@ -1,6 +1,6 @@
 import Foundation
 
-/// Headless entry point: `MailBoxShip --ship [profile] [--build-only]`.
+/// Headless entry point: `MailBoxShip --ship [profile] [--build-only] [--debug]`.
 ///
 /// Runs the same `Pipeline` the window drives, against the same saved data, so
 /// what is exercised here is the shipping code rather than a parallel
@@ -21,7 +21,12 @@ enum CLI {
     /// Never returns — exits the process when the run finishes.
     static func run() -> Never {
         let arguments = CommandLine.arguments
-        let uploadRequested = !arguments.contains("--build-only")
+        // Debug is a development build signed for a registered device; the
+        // store has no use for one, so it never uploads — the same rule the
+        // window applies by disabling its upload button.
+        let configuration: Pipeline.Configuration =
+            arguments.contains("--debug") ? .debug : .release
+        let uploadRequested = !arguments.contains("--build-only") && configuration == .release
 
         // First bare argument after --ship names the profile.
         let named = arguments.drop(while: { $0 != "--ship" }).dropFirst()
@@ -52,7 +57,8 @@ enum CLI {
             }
 
             say("Profile: \(profile.name)  (\(profile.bundleID))\n")
-            say("Mode:    \(uploadRequested ? "build + upload" : "build only")\n\n")
+            say("Mode:    \(configuration.rawValue) · "
+                + "\(uploadRequested ? "build + upload" : "build only")\n\n")
 
             // Detection fills in the entitlements map, which is what lets each
             // App ID get exactly the capabilities its own target declares.
@@ -65,7 +71,7 @@ enum CLI {
             let input = Pipeline.Input(
                 projectPath: profile.projectPath,
                 scheme: scheme,
-                configuration: .release,
+                configuration: configuration,
                 // The CLI always reads the project first, so detection is the
                 // authority here; the saved choice only covers a project that
                 // could not be read at all.

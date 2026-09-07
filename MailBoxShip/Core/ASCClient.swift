@@ -75,8 +75,41 @@ struct ASCClient {
 
     // MARK: - Requests
 
+    /// A 5xx from Apple, kept apart from every other failure because it is the
+    /// one worth trying again.
+    private struct TransientFailure: Error {
+        let message: String
+    }
+
+    /// Delays between attempts, in seconds. Three of them because the case this
+    /// exists for — the account being briefly inconsistent with itself — clears
+    /// in seconds, and a build that waits fifteen of them beats one that stops.
+    private static let retryDelays: [Double] = [2, 5, 10]
+
     @discardableResult
     private func request(
+        _ method: String, _ path: String, body: [String: Any]? = nil,
+    ) async throws -> [String: Any] {
+        // Apple's 5xx here are routinely transient, and the reliable way to
+        // provoke one is to create a profile seconds after registering the
+        // device it names: the device is real, the profile service has not seen
+        // it yet, and the answer is a bare "An unexpected error occurred on the
+        // server side" that reads like a permanent fault. Waiting and asking
+        // again is what makes the first ship from a new machine work.
+        var remaining = Self.retryDelays[...]
+        while true {
+            do {
+                return try await attempt(method, path, body: body)
+            } catch let transient as TransientFailure {
+                guard let delay = remaining.first else { throw ShipError(transient.message) }
+                remaining = remaining.dropFirst()
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+    }
+
+    @discardableResult
+    private func attempt(
         _ method: String, _ path: String, body: [String: Any]? = nil,
     ) async throws -> [String: Any] {
         // `path` is normally relative and gets the base prepended; Apple's
@@ -112,7 +145,9 @@ struct ASCClient {
                     + "is still active there."
                 )
             }
-            throw ShipError("\(method) \(path) failed (\(status)): \(Self.describe(data))")
+            let message = "\(method) \(path) failed (\(status)): \(Self.describe(data))"
+            guard status < 500 else { throw TransientFailure(message: message) }
+            throw ShipError(message)
         }
         guard !data.isEmpty else { return [:] }
         return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
@@ -423,6 +458,76 @@ struct ASCClient {
         try await request("DELETE", "/v1/certificates/\(id)")
     }
 
+    // MARK: - Devices
+
+    struct Device {
+        let id: String
+        /// Uppercased, so a comparison against a UDID read off this machine or
+        /// typed by hand does not turn on letter case.
+        let udid: String
+        let name: String
+        /// `IOS` or `MAC_OS` — the same spelling App IDs use.
+        let platform: String
+        /// `ENABLED` or `DISABLED`. A disabled device stays in the list and
+        /// Apple rejects any profile that names one.
+        let status: String
+
+        var isEnabled: Bool { status == "ENABLED" }
+    }
+
+    /// Every device registered on the account, disabled ones included.
+    func devices() async throws -> [Device] {
+        try await requestAll("/v1/devices?limit=200").compactMap { item in
+            guard
+                let id = item["id"] as? String,
+                let a = item["attributes"] as? [String: Any]
+            else { return nil }
+            return Device(
+                id: id,
+                udid: (a["udid"] as? String ?? "").uppercased(),
+                name: a["name"] as? String ?? "",
+                platform: a["platform"] as? String ?? "",
+                status: a["status"] as? String ?? "",
+            )
+        }
+    }
+
+    /// Register a device, or return the one already holding that UDID.
+    ///
+    /// A UDID already on the account is not a failure worth ending a build
+    /// over. Apple answers a duplicate with a 409 whose wording has changed
+    /// more than once, so the reliable test is to look the UDID up again rather
+    /// than to match on the message.
+    func registerDevice(name: String, udid: String, platform: String) async throws -> Device {
+        do {
+            let json = try await request("POST", "/v1/devices", body: [
+                "data": [
+                    "type": "devices",
+                    "attributes": ["name": name, "udid": udid, "platform": platform],
+                ],
+            ])
+            guard
+                let d = json["data"] as? [String: Any],
+                let id = d["id"] as? String
+            else { throw ShipError("Device registered but the response was unreadable") }
+
+            let a = d["attributes"] as? [String: Any] ?? [:]
+            return Device(
+                id: id,
+                udid: (a["udid"] as? String ?? udid).uppercased(),
+                name: a["name"] as? String ?? name,
+                platform: a["platform"] as? String ?? platform,
+                status: a["status"] as? String ?? "ENABLED",
+            )
+        } catch {
+            if let existing = try? await devices()
+                .first(where: { $0.udid == udid.uppercased() }) {
+                return existing
+            }
+            throw error
+        }
+    }
+
     // MARK: - Profiles
 
     struct Profile {
@@ -433,19 +538,43 @@ struct ASCClient {
         let content: String
     }
 
+    /// Issue a profile. `deviceIDs` is required for a development profile and
+    /// must be empty for a store one.
+    ///
+    /// A development profile is scoped to named machines: omit the `devices`
+    /// relationship and Apple refuses the create with 409 "The relationship
+    /// 'devices' is required but was not provided", which reads like a bug in
+    /// the request rather than a missing account setup. A store profile carries
+    /// no devices at all, so the relationship is sent only when there are any.
     func createProfile(
         name: String, type: String, bundleIDResource: String, certificateID: String,
+        deviceIDs: [String] = [],
     ) async throws -> Profile {
-        let json = try await request("POST", "/v1/profiles", body: [
-            "data": [
-                "type": "profiles",
-                "attributes": ["name": name, "profileType": type],
-                "relationships": [
-                    "bundleId": ["data": ["type": "bundleIds", "id": bundleIDResource]],
-                    "certificates": ["data": [["type": "certificates", "id": certificateID]]],
+        var relationships: [String: Any] = [
+            "bundleId": ["data": ["type": "bundleIds", "id": bundleIDResource]],
+            "certificates": ["data": [["type": "certificates", "id": certificateID]]],
+        ]
+        if !deviceIDs.isEmpty {
+            relationships["devices"] = ["data": deviceIDs.map { ["type": "devices", "id": $0] }]
+        }
+
+        let json: [String: Any]
+        do {
+            json = try await request("POST", "/v1/profiles", body: [
+                "data": [
+                    "type": "profiles",
+                    "attributes": ["name": name, "profileType": type],
+                    "relationships": relationships,
                 ],
-            ],
-        ])
+            ])
+        } catch {
+            // A create Apple commits and *then* reports as failed leaves the
+            // profile in place, and the retry above is refused because names
+            // are unique per team. That profile is the one being asked for, so
+            // take it rather than ending the build over a bookkeeping error.
+            if let existing = await profile(named: name) { return existing }
+            throw error
+        }
         guard
             let d = json["data"] as? [String: Any],
             let id = d["id"] as? String,
@@ -459,6 +588,26 @@ struct ASCClient {
             uuid: a["uuid"] as? String ?? UUID().uuidString,
             content: content,
         )
+    }
+
+    /// A profile by name, or nil if the account has none — including when the
+    /// lookup itself fails, since every caller is already on a failure path.
+    private func profile(named name: String) async -> Profile? {
+        guard let items = try? await requestAll("/v1/profiles?limit=200") else { return nil }
+        for item in items {
+            guard
+                let a = item["attributes"] as? [String: Any],
+                a["name"] as? String == name,
+                let id = item["id"] as? String,
+                let content = a["profileContent"] as? String
+            else { continue }
+            return Profile(
+                id: id, name: name,
+                uuid: a["uuid"] as? String ?? UUID().uuidString,
+                content: content,
+            )
+        }
+        return nil
     }
 }
 
