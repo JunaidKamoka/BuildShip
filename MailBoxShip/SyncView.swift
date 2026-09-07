@@ -109,9 +109,7 @@ struct SyncView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 8) {
-                TextField("Paste a pairing code…", text: $redeemField)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 11, design: .monospaced))
+                ShipTextField("Paste a pairing code…", text: $redeemField, mono: true)
                 Button("Pair") { sync.redeem(pairingCode: redeemField); redeemField = "" }
                     .disabled(sync.busy || redeemField.isEmpty)
             }

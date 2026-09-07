@@ -209,12 +209,7 @@ struct SimpleView: View {
                 }
             }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: Design.corner, style: .continuous)
-            .fill(Color(nsColor: .controlBackgroundColor)))
-        .overlay(RoundedRectangle(cornerRadius: Design.corner, style: .continuous)
-            .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
+        .cardSurface(padding: 14)
     }
 
     // MARK: - Auto-detected summary
@@ -260,12 +255,7 @@ struct SimpleView: View {
                 }
             }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: Design.corner, style: .continuous)
-            .fill(Color(nsColor: .controlBackgroundColor)))
-        .overlay(RoundedRectangle(cornerRadius: Design.corner, style: .continuous)
-            .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
+        .cardSurface(padding: 14)
     }
 
     /// Which platform to upload. Defaults to what the project detected, but a
@@ -328,10 +318,7 @@ struct SimpleView: View {
                     Image(systemName: p.issuerID.isEmpty ? "questionmark.circle" : "pencil")
                         .font(.system(size: 11))
                         .foregroundStyle(p.issuerID.isEmpty ? Design.warning : Color.secondary)
-                    TextField("Issuer ID — the UUID beside the key in App Store Connect",
-                              text: store.binding(\.issuerID))
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 12, design: .monospaced))
+                    ShipTextField("Issuer ID — the UUID beside the key in App Store Connect", text: store.binding(\.issuerID), mono: true)
                         .onSubmit { finishIssuer() }
                     if p.issuerID.isEmpty {
                         Pill(text: "Required", color: Design.warning)
@@ -460,12 +447,7 @@ struct SimpleView: View {
 
             if !runner.log.isEmpty { logConsole }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: Design.corner, style: .continuous)
-            .fill(Color(nsColor: .controlBackgroundColor)))
-        .overlay(RoundedRectangle(cornerRadius: Design.corner, style: .continuous)
-            .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
+        .cardSurface(padding: 14)
     }
 
     private var stageStrip: some View {

@@ -63,21 +63,24 @@ struct AdvancedView: View {
 
             Divider()
 
-            HStack(spacing: 2) {
+            // Two groups, not six evenly spaced glyphs: making a profile sits
+            // apart from acting on the one selected, and the gap between them
+            // says which is which without a label on either.
+            HStack(spacing: 1) {
                 sidebarButton("plus", "New profile") { store.addProfile() }
                 sidebarButton("plus.square.on.square", "Duplicate") { store.duplicateSelected() }
                 sidebarButton("pencil", "Rename") {
                     draftName = store.current.name
                     renaming = true
                 }
-                Spacer()
+                Spacer(minLength: Design.Gap.medium)
                 sidebarButton("arrow.triangle.2.circlepath", "Sync across Macs") { showSync = true }
                 sidebarButton("info.circle", "Where profiles are stored") { showingStorageInfo = true }
-                sidebarButton("trash", "Delete") { store.deleteSelected() }
+                sidebarButton("trash", "Delete", danger: true) { store.deleteSelected() }
                     .disabled(store.profiles.count <= 1)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+            .padding(.horizontal, Design.Gap.small)
+            .padding(.vertical, 7)
         }
         .disabled(runner.isRunning)
         .alert("Rename profile", isPresented: $renaming) {
@@ -183,14 +186,15 @@ struct AdvancedView: View {
         return profile.name
     }
 
+    /// A hover fill and a real hit area, because six bare glyphs in a row read
+    /// as decoration until one of them lights up under the pointer. Delete is
+    /// the one that turns red — it is the only button here that destroys
+    /// something, and it should say so before it is pressed rather than after.
     private func sidebarButton(
-        _ symbol: String, _ help: String, action: @escaping () -> Void,
+        _ symbol: String, _ help: String, danger: Bool = false,
+        action: @escaping () -> Void,
     ) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol).frame(width: 22, height: 20)
-        }
-        .buttonStyle(.borderless)
-        .help(help)
+        SidebarIconButton(symbol: symbol, help: help, danger: danger, action: action)
     }
 
     // MARK: - Detail
@@ -231,25 +235,28 @@ struct AdvancedView: View {
         .task(id: store.selectedID) { await detect() }
     }
 
+    /// The app being shipped, its version, and the two things you can reach for
+    /// from anywhere.
+    ///
+    /// Shows the *app's own icon* where it can be read, rather than the
+    /// paperplane on every profile. A window that looks identical whichever
+    /// client is selected is a window it is easy to ship the wrong app from,
+    /// and the icon is the fastest thing on screen to recognise.
     private var header: some View {
-        HStack(spacing: 14) {
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(Design.accent)
-                .frame(width: 44, height: 44)
-                .overlay(
-                    Image(systemName: "paperplane.fill")
-                        .font(.system(size: 19, weight: .medium))
-                        .foregroundStyle(.white),
-                )
+        HStack(spacing: Design.Gap.medium) {
+            headerIcon
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(store.current.name)
-                    .font(.system(size: 17, weight: .semibold))
-                HStack(spacing: 6) {
+                    .font(.system(size: 16, weight: .semibold))
+                    .lineLimit(1)
+                HStack(spacing: Design.Gap.tight + 2) {
                     Text(store.current.bundleID.isEmpty
                          ? "No bundle identifier yet" : store.current.bundleID)
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(Design.Face.mono)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                     if !detected.extensionBundleIDs.isEmpty {
                         Pill(text: "+\(detected.extensionBundleIDs.count) extension",
                              color: .secondary)
@@ -257,39 +264,61 @@ struct AdvancedView: View {
                 }
             }
 
-            Spacer()
+            Spacer(minLength: Design.Gap.medium)
 
             if !detected.marketingVersion.isEmpty {
-                VStack(alignment: .trailing, spacing: 1) {
-                    Text("\(store.current.marketingVersion.isEmpty ? detected.marketingVersion : store.current.marketingVersion)")
-                        .font(.system(size: 15, weight: .semibold, design: .rounded))
-                    Text("build \(store.current.buildNumber.isEmpty ? detected.buildNumber : store.current.buildNumber)")
-                        .font(.system(size: 10))
+                let version = store.current.marketingVersion.isEmpty
+                    ? detected.marketingVersion : store.current.marketingVersion
+                let build = store.current.buildNumber.isEmpty
+                    ? detected.buildNumber : store.current.buildNumber
+
+                // Set in a well of its own. These are the two figures that
+                // decide whether an upload is accepted at all, and loose on the
+                // background they read as a caption on the buttons beside them.
+                HStack(spacing: 5) {
+                    Text(version).font(Design.Face.figure)
+                    Text("build \(build)")
+                        .font(Design.Face.caption)
                         .foregroundStyle(.secondary)
                 }
+                .padding(.horizontal, Design.Gap.small)
+                .padding(.vertical, 5)
+                .fieldSurface()
+                .help("Marketing version and build number this run would ship")
             }
 
-            Button { Builds.open() } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "tray.full").font(.system(size: 10))
-                    Text("Builds").font(.system(size: 11))
-                }
-            }
-            .buttonStyle(.borderless)
-            .help("Open the folder every finished build is kept in")
+            QuietButton(title: "Builds", symbol: "tray.full") { Builds.open() }
+                .help("Open the folder every finished build is kept in")
 
-            Button(action: onSimple) {
-                HStack(spacing: 4) {
-                    Image(systemName: "wand.and.stars").font(.system(size: 10))
-                    Text("Simple").font(.system(size: 11))
-                }
-            }
-            .buttonStyle(.borderless)
-            .help("Switch to the simple one-screen deploy")
-            .disabled(runner.isRunning)
+            QuietButton(title: "Simple", symbol: "wand.and.stars",
+                        enabled: !runner.isRunning, action: onSimple)
+                .help("Switch to the simple one-screen deploy")
         }
         .padding(.horizontal, 18)
-        .padding(.vertical, 14)
+        .padding(.vertical, 12)
+    }
+
+    /// The real app icon once one has been read, the accent badge until then.
+    @ViewBuilder private var headerIcon: some View {
+        if let icon = identities.identity(for: store.current)?.icon {
+            Image(nsImage: icon)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 40, height: 40)
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .shadow(color: .black.opacity(0.14), radius: 2.5, y: 1)
+        } else {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Design.accent)
+                .frame(width: 40, height: 40)
+                .overlay(
+                    Image(systemName: "paperplane.fill")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(.white),
+                )
+                .shadow(color: Design.accentSolid.opacity(0.30), radius: 4, y: 1.5)
+        }
     }
 
     // MARK: Cards
@@ -329,8 +358,7 @@ struct AdvancedView: View {
 
             Row("Scheme") {
                 if detected.schemes.isEmpty {
-                    TextField("MailBox", text: store.binding(\.scheme))
-                        .textFieldStyle(.roundedBorder)
+                    ShipTextField("MailBox", text: store.binding(\.scheme))
                 } else {
                     // Bound by hand rather than through `store.binding`, so that
                     // re-detection follows a choice made *here* and not every
@@ -352,16 +380,11 @@ struct AdvancedView: View {
             }
 
             Row("Bundle ID") {
-                TextField("com.example.app", text: store.binding(\.bundleID))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12, design: .monospaced))
+                ShipTextField("com.example.app", text: store.binding(\.bundleID), mono: true)
             }
 
             Row("Extensions") {
-                TextField("optional, comma separated",
-                          text: store.binding(\.extensionBundleIDsRaw))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12, design: .monospaced))
+                ShipTextField("optional, comma separated", text: store.binding(\.extensionBundleIDsRaw), mono: true)
             }
 
             Row("Platform") {
@@ -418,9 +441,7 @@ struct AdvancedView: View {
             }
 
             Row("Key ID") {
-                TextField("ABCDE12345", text: store.binding(\.keyID))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12, design: .monospaced))
+                ShipTextField("ABCDE12345", text: store.binding(\.keyID), mono: true)
                 if store.keyIDLooksWrong {
                     Pill(text: "expects 10 chars", color: Design.warning,
                          symbol: "exclamationmark")
@@ -428,10 +449,7 @@ struct AdvancedView: View {
             }
 
             Row("Issuer ID") {
-                TextField("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-                          text: store.binding(\.issuerID))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12, design: .monospaced))
+                ShipTextField("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", text: store.binding(\.issuerID), mono: true)
 
                 if !store.knownKeys.isEmpty {
                     Menu {
@@ -461,18 +479,13 @@ struct AdvancedView: View {
                 )
             }
 
-            HStack(spacing: 6) {
-                Image(systemName: "lock.shield.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(Design.success)
-                Text("No Apple ID, and nothing kept in the Keychain. Both files stay where you "
-                     + "put them — only paths are saved — and signing happens in a keychain "
-                     + "deleted after each run. Reusing one identity across every app on the "
-                     + "account is what avoids Apple's two-certificate cap.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            Note(
+                text: "No Apple ID, and nothing kept in the Keychain. Both files stay where you "
+                    + "put them — only paths are saved — and signing happens in a keychain "
+                    + "deleted after each run. Reusing one identity across every app on the "
+                    + "account is what avoids Apple's two-certificate cap.",
+                symbol: "lock.shield.fill",
+            )
             .padding(.top, 2)
         }
     }
@@ -488,9 +501,7 @@ struct AdvancedView: View {
 
             if store.current.proxy.enabled {
                 Row("Host") {
-                    TextField("gw.example.com", text: store.proxyBinding(\.host, default: ""))
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 12, design: .monospaced))
+                    ShipTextField("gw.example.com", text: store.proxyBinding(\.host, default: ""), mono: true)
 
                     if !store.knownProxies.isEmpty {
                         Menu {
@@ -506,9 +517,15 @@ struct AdvancedView: View {
                     }
                 }
                 Row("Sticky port") {
+                    // Bound through a formatter rather than a string, so this
+                    // one keeps `TextField` and wears the shared well directly.
                     TextField("10000", value: store.proxyBinding(\.port, default: 0),
                               formatter: NumberFormatter())
-                        .textFieldStyle(.roundedBorder)
+                        .textFieldStyle(.plain)
+                        .font(Design.Face.body)
+                        .padding(.horizontal, Design.Gap.small)
+                        .padding(.vertical, 5)
+                        .fieldSurface()
                         .frame(width: 90)
                     Button("Assign free port") { store.assignStickyPort() }
                         .controlSize(.small)
@@ -518,19 +535,13 @@ struct AdvancedView: View {
                     Spacer()
                 }
                 Row("Username") {
-                    TextField("optional", text: store.proxyBinding(\.username, default: ""))
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 12, design: .monospaced))
+                    ShipTextField("optional", text: store.proxyBinding(\.username, default: ""), mono: true)
                 }
                 Row("Password") {
-                    SecureField("optional", text: store.proxyPasswordBinding())
-                        .textFieldStyle(.roundedBorder)
+                    ShipSecureField("optional", text: store.proxyPasswordBinding())
                 }
                 Row("Session token") {
-                    TextField("only if your provider keys sessions on the username",
-                              text: store.proxyBinding(\.sessionSuffix, default: ""))
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 12, design: .monospaced))
+                    ShipTextField("only if your provider keys sessions on the username", text: store.proxyBinding(\.sessionSuffix, default: ""), mono: true)
                 }
 
                 HStack(spacing: 6) {
@@ -676,18 +687,14 @@ struct AdvancedView: View {
                 }
 
                 Row("Contact") {
-                    TextField("First", text: store.binding(\.reviewFirstName))
-                        .textFieldStyle(.roundedBorder)
-                    TextField("Last", text: store.binding(\.reviewLastName))
-                        .textFieldStyle(.roundedBorder)
+                    ShipTextField("First", text: store.binding(\.reviewFirstName))
+                    ShipTextField("Last", text: store.binding(\.reviewLastName))
                 }
                 Row("Email") {
-                    TextField("you@example.com", text: store.binding(\.reviewEmail))
-                        .textFieldStyle(.roundedBorder)
+                    ShipTextField("you@example.com", text: store.binding(\.reviewEmail))
                 }
                 Row("Phone") {
-                    TextField("+44 7700 900000", text: store.binding(\.reviewPhone))
-                        .textFieldStyle(.roundedBorder)
+                    ShipTextField("+44 7700 900000", text: store.binding(\.reviewPhone))
                 }
 
                 Toggle(isOn: store.boolBinding(\.demoAccountRequired)) {
@@ -698,20 +705,15 @@ struct AdvancedView: View {
 
                 if store.current.demoAccountRequired {
                     Row("Demo username") {
-                        TextField("qa@example.com", text: store.binding(\.demoAccountName))
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 12, design: .monospaced))
+                        ShipTextField("qa@example.com", text: store.binding(\.demoAccountName), mono: true)
                     }
                     Row("Demo password") {
-                        SecureField("", text: store.demoPasswordBinding())
-                            .textFieldStyle(.roundedBorder)
+                        ShipSecureField("", text: store.demoPasswordBinding())
                     }
                 }
 
                 Row("Notes") {
-                    TextField("anything the reviewer needs to know",
-                              text: store.binding(\.reviewNotes))
-                        .textFieldStyle(.roundedBorder)
+                    ShipTextField("anything the reviewer needs to know", text: store.binding(\.reviewNotes))
                 }
 
                 Text("Saved with this store, so each client keeps its own contact and demo "
@@ -743,13 +745,9 @@ struct AdvancedView: View {
             HStack(spacing: 10) {
                 Text("Version").font(.system(size: 12)).foregroundStyle(.secondary)
                     .frame(width: Design.labelWidth, alignment: .leading)
-                TextField(detected.marketingVersion.isEmpty ? "1.0" : detected.marketingVersion,
-                          text: store.binding(\.marketingVersion))
-                    .textFieldStyle(.roundedBorder).frame(width: 90)
+                ShipTextField(detected.marketingVersion.isEmpty ? "1.0" : detected.marketingVersion, text: store.binding(\.marketingVersion)).frame(width: 90)
                 Text("Build").font(.system(size: 12)).foregroundStyle(.secondary)
-                TextField(detected.buildNumber.isEmpty ? "1" : detected.buildNumber,
-                          text: store.binding(\.buildNumber))
-                    .textFieldStyle(.roundedBorder).frame(width: 90)
+                ShipTextField(detected.buildNumber.isEmpty ? "1" : detected.buildNumber, text: store.binding(\.buildNumber)).frame(width: 90)
                 Spacer()
             }
 
@@ -793,45 +791,33 @@ struct AdvancedView: View {
                 .disabled(runner.isRunning)
 
                 if !runner.log.isEmpty {
-                    Button {
-                        showingLog = true
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "text.alignleft").font(.system(size: 10))
-                            Text("Log").font(.system(size: 11))
-                        }
-                    }
-                    .buttonStyle(.borderless)
+                    QuietButton(title: "Log", symbol: "text.alignleft") { showingLog = true }
                 }
 
-                Spacer()
+                Spacer(minLength: Design.Gap.medium)
 
                 if runner.failed {
-                    Text(runner.status)
-                        .font(.system(size: 11))
-                        .foregroundStyle(Design.failure)
-                        .lineLimit(2)
-                        .frame(maxWidth: 320, alignment: .trailing)
+                    // The failure text and the buttons were competing for the
+                    // same strip of bar. An icon and a tint make it read as a
+                    // status rather than as another label.
+                    HStack(spacing: 5) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10))
+                        Text(runner.status)
+                            .font(Design.Face.label)
+                            .lineLimit(2)
+                    }
+                    .foregroundStyle(Design.failure)
+                    .frame(maxWidth: 320, alignment: .trailing)
                 }
 
-                Button {
-                    start(upload: false)
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "hammer.fill").font(.system(size: 12))
-                        Text("Build IPA").font(.system(size: 12, weight: .medium))
-                    }
-                    .padding(.horizontal, 12).padding(.vertical, 8)
-                }
-                .buttonStyle(.plain)
-                .background(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(Color.primary.opacity(0.07)),
-                )
                 // Detection has to land first: it is what says which platform
                 // the scheme builds, and a run started before it reports is
                 // built from whatever was left in state.
-                .disabled(runner.isRunning || detecting)
+                ActionButton(
+                    title: "Build IPA", symbol: "hammer.fill",
+                    enabled: !runner.isRunning && !detecting,
+                ) { start(upload: false) }
 
                 PrimaryButton(
                     title: runner.isRunning ? "Working…" : "Build & Upload",
