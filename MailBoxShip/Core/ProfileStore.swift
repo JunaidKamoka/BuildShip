@@ -586,17 +586,38 @@ final class ProfileStore: ObservableObject {
         scheduleSave()
     }
 
+    /// Adopt the app's own display name — what the icon says on a Home screen —
+    /// for any profile still carrying the placeholder.
+    ///
+    /// `adoptProject` names a profile after the *project file*, which is the
+    /// only thing available at the moment a project is chosen. The app's real
+    /// name is a directory walk away and arrives later, so it lands here
+    /// instead. Profiles saved before either existed are fixed on sight.
+    func adoptDisplayName(_ name: String, forProjectPath path: String) {
+        let proposed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !proposed.isEmpty, !path.isEmpty else { return }
+        var changed = false
+        for index in profiles.indices
+        where profiles[index].projectPath == path && Self.isPlaceholderName(profiles[index].name) {
+            profiles[index].name = uniqueName(proposed)
+            changed = true
+        }
+        if changed { scheduleSave() }
+    }
+
     /// True for the untouched placeholder in any of its forms — "New profile"
     /// and the numbered "New profile 2" / "New profile 11" that `uniqueName`
     /// produces for additional stores. Anything the user has renamed to falls
     /// through, so adopting a project never overwrites a chosen name.
-    private func isDefaultName(_ name: String) -> Bool {
+    static func isPlaceholderName(_ name: String) -> Bool {
         if name == "New profile" { return true }
         let prefix = "New profile "
         guard name.hasPrefix(prefix) else { return false }
         let rest = name.dropFirst(prefix.count)
         return !rest.isEmpty && rest.allSatisfy(\.isNumber)
     }
+
+    private func isDefaultName(_ name: String) -> Bool { Self.isPlaceholderName(name) }
 
     // MARK: - Validation
 

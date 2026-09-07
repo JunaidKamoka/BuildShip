@@ -14,6 +14,7 @@
 		2B6ADDDD50B6F8ABA06B7B39 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 271E878FB452AEF07AF6213E /* ContentView.swift */; };
 		3B08EEAC19CB618384F3C462 /* ProjectInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1252A266443D7DAE11F410B /* ProjectInspector.swift */; };
 		3BAF4325CB8D12CC34BCA595 /* Settings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99AB7A05D9A141F62E61B591 /* Settings.swift */; };
+		5154DBDB0DBE7DC99B0D9C58 /* AppIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE48A7C289CE91FF9B1665D0 /* AppIdentity.swift */; };
 		609C92E89EB1FC1211602CD5 /* ProxyConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = C35C813D12F8496BE2A2643C /* ProxyConfig.swift */; };
 		64EF9F0180F64ACAE1D6384A /* BuildResult.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6246CF1FDBCB37A17D338D6 /* BuildResult.swift */; };
 		6D983A4465F6DCB404403AC4 /* Pipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44DBB8F7F09C8E16BC3D00AC /* Pipeline.swift */; };
@@ -55,6 +56,7 @@
 		C35C813D12F8496BE2A2643C /* ProxyConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyConfig.swift; sourceTree = "<group>"; };
 		CDAF49BC6D223D654815A36E /* ASCClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ASCClient.swift; sourceTree = "<group>"; };
 		D286110742084D34F7A9E96E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		DE48A7C289CE91FF9B1665D0 /* AppIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppIdentity.swift; sourceTree = "<group>"; };
 		E1252A266443D7DAE11F410B /* ProjectInspector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectInspector.swift; sourceTree = "<group>"; };
 		F84F99932128825AE5269E00 /* MailBoxShipApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MailBoxShipApp.swift; sourceTree = "<group>"; };
 		FE8A072A0215F7B1BF2B63B6 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
@@ -81,6 +83,7 @@
 		367C6793E09F6AB8F40EF286 /* Core */ = {
 			isa = PBXGroup;
 			children = (
+				DE48A7C289CE91FF9B1665D0 /* AppIdentity.swift */,
 				CDAF49BC6D223D654815A36E /* ASCClient.swift */,
 				9750739DB4C2417F70FD2461 /* Capabilities.swift */,
 				AA8B87979D355B3CFCD3E4DC /* CLI.swift */,
@@ -195,6 +198,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				FBF85385D351151AB6060248 /* ASCClient.swift in Sources */,
+				5154DBDB0DBE7DC99B0D9C58 /* AppIdentity.swift in Sources */,
 				64EF9F0180F64ACAE1D6384A /* BuildResult.swift in Sources */,
 				16F43288531B547B46AFF846 /* CLI.swift in Sources */,
 				06E0A41ADBE303B7CE6333B1 /* Capabilities.swift in Sources */,

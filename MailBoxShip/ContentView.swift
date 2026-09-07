@@ -11,6 +11,10 @@ struct AdvancedView: View {
     /// run in flight.
     var onSimple: () -> Void = {}
 
+    /// Real app icons and names, read from each profile's project. Owned here
+    /// so one walk per project serves every row for the life of the window.
+    @StateObject private var identities = AppIdentityStore()
+
     @State private var configuration: Pipeline.Configuration = .release
     @State private var renaming = false
     @State private var draftName = ""
@@ -109,18 +113,12 @@ struct AdvancedView: View {
     }
 
     private func profileRow(_ profile: ShipProfile) -> some View {
-        HStack(spacing: 9) {
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Design.accent)
-                .frame(width: 26, height: 26)
-                .overlay(
-                    Text(String(profile.name.prefix(1)).uppercased())
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(.white),
-                )
+        let identity = identities.identity(for: profile)
+        return HStack(spacing: 9) {
+            profileIcon(profile, icon: identity?.icon)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(profile.name)
+                Text(displayName(for: profile, identity: identity))
                     .font(.system(size: 12, weight: .medium))
                     .lineLimit(1)
                 Text(profile.bundleID.isEmpty ? "Not configured" : profile.bundleID)
@@ -140,6 +138,49 @@ struct AdvancedView: View {
             }
         }
         .padding(.vertical, 3)
+        .task(id: profile.projectPath + profile.bundleID) {
+            guard let found = await identities.load(profile),
+                  let name = found.displayName
+            else { return }
+            // Only ever fills in the "New profile 11" placeholder — a name the
+            // user typed is theirs and is left alone.
+            store.adoptDisplayName(name, forProjectPath: profile.projectPath)
+        }
+    }
+
+    /// The app's real icon, or the initial of its name until one is found.
+    @ViewBuilder
+    private func profileIcon(_ profile: ShipProfile, icon: NSImage?) -> some View {
+        if let icon {
+            Image(nsImage: icon)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 26, height: 26)
+                // iOS icons are shipped square and masked by the system; a Mac
+                // icon already has its own rounding baked in and is padded to
+                // the corners, so the same clip leaves it untouched.
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        } else {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Design.accent)
+                .frame(width: 26, height: 26)
+                .overlay(
+                    Text(String(profile.name.prefix(1)).uppercased())
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(.white),
+                )
+        }
+    }
+
+    /// What to call this profile in the list. The saved name wins, except while
+    /// it is still the placeholder nobody chose — then the app's own name is
+    /// shown as soon as it is read, without waiting for the rename to be saved.
+    private func displayName(for profile: ShipProfile, identity: AppIdentity?) -> String {
+        if ProfileStore.isPlaceholderName(profile.name), let real = identity?.displayName {
+            return real
+        }
+        return profile.name
     }
 
     private func sidebarButton(
