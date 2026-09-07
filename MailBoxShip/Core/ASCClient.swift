@@ -7,7 +7,7 @@ import CryptoKit
 /// certificate, the App ID, the provisioning profiles — is obtained from this
 /// API using nothing but the `.p8` key. That is the whole point: no Apple ID
 /// is signed in, no account is added to Xcode, and no identity belonging to
-/// this machine is involved at any stage.
+/// this machine is involved at any stage. 
 ///
 /// It also sidesteps Xcode's *cloud signing* service, which refuses App Store
 /// Connect API keys with a bare "Cloud signing permission error". Requesting a
