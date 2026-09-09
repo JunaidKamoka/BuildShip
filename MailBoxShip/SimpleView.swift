@@ -14,6 +14,11 @@ struct SimpleView: View {
     @ObservedObject var sync: SyncStore
     var onAdvanced: () -> Void
 
+    /// Real app icons and names, read from each profile's project — the same
+    /// walk the advanced screen does, so the client you are about to ship is
+    /// recognisable by its own icon rather than a row of identical glyphs.
+    @StateObject private var identities = AppIdentityStore()
+
     @State private var detected = ProjectInspector.Info()
     @State private var detecting = false
     @State private var note = ""
@@ -76,7 +81,12 @@ struct SimpleView: View {
         .task(id: store.selectedID) {
             store.applyBakedProxyIfNeeded()
             uploaderInstalled = Transporter.isInstalled
+            // A saved profile already knows its bundle id, so this shows the
+            // icon at once; the reload after detection only walks again on the
+            // first configuration, when the id has just been discovered.
+            await identities.load(store.current)
             await detect()
+            await identities.load(store.current)
             await fetchTeam()
         }
         .sheet(isPresented: $showSync) { SyncView(sync: sync) }
@@ -91,6 +101,7 @@ struct SimpleView: View {
                 .frame(width: 34, height: 34)
                 .overlay(Image(systemName: "paperplane.fill")
                     .font(.system(size: 15, weight: .medium)).foregroundStyle(.white))
+                .shadow(color: Design.accentSolid.opacity(0.28), radius: 4, y: 1.5)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text("MailBoxShip").font(.system(size: 15, weight: .semibold))
@@ -100,85 +111,40 @@ struct SimpleView: View {
 
             Spacer()
 
-            clientMenu
+            ClientSwitcher(store: store, identities: identities, disabled: runner.isRunning)
 
-            Button { Builds.open() } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "tray.full").font(.system(size: 10))
-                    Text("Builds").font(.system(size: 11))
-                }
-            }
-            .buttonStyle(.borderless)
-            .help("Open the folder every finished build is kept in")
-
-            Button { showSync = true } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 10))
-                    Text("Sync").font(.system(size: 11))
-                }
-            }
-            .buttonStyle(.borderless)
-            .help("Sync profiles and keys across your Macs")
-
-            Button(action: onAdvanced) {
-                HStack(spacing: 4) {
-                    Image(systemName: "slider.horizontal.3").font(.system(size: 10))
-                    Text("Advanced").font(.system(size: 11))
-                }
-            }
-            .buttonStyle(.borderless)
-            .help("Open the full interface with every option")
-            .disabled(runner.isRunning)
+            QuietButton(title: "Builds", symbol: "tray.full") { Builds.open() }
+                .help("Open the folder every finished build is kept in")
+            QuietButton(title: "Sync", symbol: "arrow.triangle.2.circlepath") { showSync = true }
+                .help("Sync profiles and keys across your Macs")
+            QuietButton(title: "Advanced", symbol: "slider.horizontal.3",
+                        enabled: !runner.isRunning, action: onAdvanced)
+                .help("Open the full interface with every option")
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
-    }
-
-    /// Switch between saved clients, or start a new one — the only trace of the
-    /// multi-profile model the simple screen keeps.
-    private var clientMenu: some View {
-        Menu {
-            ForEach(store.profiles.sorted { $0.lastUsed > $1.lastUsed }) { profile in
-                Button {
-                    store.selectedID = profile.id
-                } label: {
-                    Label(profile.name, systemImage: profile.id == store.selectedID
-                          ? "checkmark" : "person.crop.circle")
-                }
-            }
-            Divider()
-            Button {
-                store.addProfile()
-            } label: { Label("New client", systemImage: "plus") }
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "person.crop.circle").font(.system(size: 11))
-                Text(p.name).font(.system(size: 11)).lineLimit(1)
-            }
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .disabled(runner.isRunning)
     }
 
     // MARK: - Steps
 
     private var steps: some View {
         VStack(spacing: 12) {
-            stepCard(number: 1, title: "Xcode project",
-                     subtitle: "Choose the .xcodeproj — or drop it here") {
+            StepCard(number: 1, title: "Xcode project",
+                     subtitle: "Choose the .xcodeproj — or drop it here",
+                     done: !p.projectPath.isEmpty) {
                 PathField(path: p.projectPath, prompt: "Choose…",
                           types: [UTType(filenameExtension: "xcodeproj") ?? .directory]) { chosen in
                     guard let resolved = ProjectInspector.resolveProject(at: chosen) else {
                         note = "No .xcodeproj found in that folder."; noteWarn = true; return
                     }
                     store.adoptProject(path: resolved)
-                    Task { await detect(); await fetchTeam() }
+                    Task { await detect(); await identities.load(store.current); await fetchTeam() }
                 }
             }
 
-            stepCard(number: 2, title: "App Store Connect key",
+            StepCard(number: 2, title: "App Store Connect key",
                      subtitle: "Drop the AuthKey_….p8 from any folder",
+                     done: !p.keyPath.isEmpty,
                      footer: AnyView(issuerField)) {
                 PathField(path: p.keyPath, prompt: "Choose…",
                           types: [UTType(filenameExtension: "p8") ?? .data]) { chosen in
@@ -187,29 +153,6 @@ struct SimpleView: View {
                 }
             }
         }
-    }
-
-    private func stepCard<Content: View>(
-        number: Int, title: String, subtitle: String,
-        footer: AnyView? = nil,
-        @ViewBuilder content: () -> Content,
-    ) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            ZStack {
-                Circle().fill(Design.accent).frame(width: 24, height: 24)
-                Text("\(number)").font(.system(size: 12, weight: .bold)).foregroundStyle(.white)
-            }
-            VStack(alignment: .leading, spacing: 7) {
-                Text(title).font(.system(size: 13, weight: .semibold))
-                content()
-                Text(subtitle).font(.system(size: 11)).foregroundStyle(.secondary)
-                if let footer {
-                    Divider().padding(.vertical, 1)
-                    footer
-                }
-            }
-        }
-        .cardSurface(padding: 14)
     }
 
     // MARK: - Auto-detected summary
@@ -650,5 +593,303 @@ struct WrapChips: Layout {
             x += size.width + spacing
             rowHeight = max(rowHeight, size.height)
         }
+    }
+}
+
+// MARK: - App icon
+
+/// A profile's real app icon, or an accent tile carrying its initial until one
+/// has been read. The single place the simple screen turns an `NSImage` into a
+/// thumbnail, so the topbar badge, the switcher and every menu row round and
+/// size it the same way.
+struct AppIconThumb: View {
+    let icon: NSImage?
+    let name: String
+    var size: CGFloat = 26
+    var corner: CGFloat = 6
+
+    @ViewBuilder
+    var body: some View {
+        if let icon {
+            Image(nsImage: icon)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fill)
+                .frame(width: size, height: size)
+                // iOS icons ship square and are masked by the system; a Mac
+                // icon already rounds itself and is padded to the corners, so
+                // the same clip leaves it untouched.
+                .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
+                .shadow(color: .black.opacity(0.12), radius: 1.5, y: 0.5)
+        } else {
+            RoundedRectangle(cornerRadius: corner, style: .continuous)
+                .fill(Design.accent)
+                .frame(width: size, height: size)
+                .overlay(
+                    Text(String(name.prefix(1)).uppercased())
+                        .font(.system(size: size * 0.46, weight: .bold))
+                        .foregroundStyle(.white),
+                )
+        }
+    }
+}
+
+// MARK: - Step card
+
+/// A numbered step whose badge flips to a green check the moment its input is
+/// satisfied, so the two things this screen needs read as a short checklist
+/// rather than two identical panels — and the card lifts under the pointer to
+/// say it is the thing being acted on.
+private struct StepCard<Content: View>: View {
+    let number: Int
+    let title: String
+    let subtitle: String
+    var done: Bool
+    var footer: AnyView?
+    let content: Content
+
+    @State private var hovering = false
+
+    init(
+        number: Int, title: String, subtitle: String, done: Bool = false,
+        footer: AnyView? = nil, @ViewBuilder content: () -> Content,
+    ) {
+        self.number = number
+        self.title = title
+        self.subtitle = subtitle
+        self.done = done
+        self.footer = footer
+        self.content = content()
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(done ? AnyShapeStyle(Design.success) : AnyShapeStyle(Design.accent))
+                    .frame(width: 24, height: 24)
+                if done {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 11, weight: .bold)).foregroundStyle(.white)
+                } else {
+                    Text("\(number)")
+                        .font(.system(size: 12, weight: .bold)).foregroundStyle(.white)
+                }
+            }
+            .animation(.easeOut(duration: 0.18), value: done)
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text(title).font(.system(size: 13, weight: .semibold))
+                content
+                Text(subtitle).font(.system(size: 11)).foregroundStyle(.secondary)
+                if let footer {
+                    Divider().padding(.vertical, 1)
+                    footer
+                }
+            }
+        }
+        .cardSurface(padding: 14)
+        .overlay(
+            RoundedRectangle(cornerRadius: Design.corner, style: .continuous)
+                .strokeBorder(done ? Design.success.opacity(0.35) : Color.clear, lineWidth: 1),
+        )
+        .shadow(color: .black.opacity(hovering ? 0.09 : 0), radius: hovering ? 6 : 0, y: 2)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.15), value: hovering)
+    }
+}
+
+// MARK: - Client switcher
+
+/// Switch between saved clients, or start a new one — the simple screen's one
+/// trace of the multi-profile model.
+///
+/// A popover rather than a system `Menu`, because the point is the *icon*: a
+/// list where each client is its own artwork is the fastest way to be sure
+/// which app is about to ship, and a native menu renders that artwork as a flat
+/// template glyph.
+private struct ClientSwitcher: View {
+    @ObservedObject var store: ProfileStore
+    @ObservedObject var identities: AppIdentityStore
+    var disabled: Bool
+
+    @State private var showing = false
+    @State private var hovering = false
+
+    private var current: ShipProfile { store.current }
+
+    var body: some View {
+        Button { showing.toggle() } label: {
+            HStack(spacing: 7) {
+                AppIconThumb(icon: identities.identity(for: current)?.icon,
+                             name: current.name, size: 22, corner: 5)
+                Text(displayName(current))
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold)).foregroundStyle(.secondary)
+            }
+            .padding(.leading, 6)
+            .padding(.trailing, 9)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.primary.opacity(hovering ? 0.09 : 0.05)),
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Design.hairline, lineWidth: 1),
+            )
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .disabled(disabled)
+        .onHover { hovering = $0 && !disabled }
+        .animation(.easeOut(duration: 0.12), value: hovering)
+        .help("Switch the client app this run ships")
+        .popover(isPresented: $showing, arrowEdge: .bottom) {
+            ClientList(store: store, identities: identities) { showing = false }
+        }
+    }
+
+    private func displayName(_ profile: ShipProfile) -> String {
+        if ProfileStore.isPlaceholderName(profile.name),
+           let real = identities.identity(for: profile)?.displayName {
+            return real
+        }
+        return profile.name
+    }
+}
+
+/// The popover body: every saved client as a row of its own icon, name and
+/// identifier, then a way to start a new one.
+private struct ClientList: View {
+    @ObservedObject var store: ProfileStore
+    @ObservedObject var identities: AppIdentityStore
+    var dismiss: () -> Void
+
+    private var sorted: [ShipProfile] {
+        store.profiles.sorted { $0.lastUsed > $1.lastUsed }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(spacing: 2) {
+                    ForEach(sorted) { profile in
+                        ClientRow(profile: profile,
+                                  identity: identities.identity(for: profile),
+                                  selected: profile.id == store.selectedID) {
+                            store.selectedID = profile.id
+                            dismiss()
+                        }
+                        .task(id: profile.projectPath + profile.bundleID) {
+                            guard let found = await identities.load(profile),
+                                  let name = found.displayName else { return }
+                            store.adoptDisplayName(name, forProjectPath: profile.projectPath)
+                        }
+                    }
+                }
+                .padding(6)
+            }
+            .frame(maxHeight: 360)
+
+            Divider()
+
+            NewClientRow {
+                store.addProfile()
+                dismiss()
+            }
+        }
+        .frame(width: 288)
+    }
+}
+
+/// One client in the switcher popover.
+private struct ClientRow: View {
+    let profile: ShipProfile
+    let identity: AppIdentity?
+    let selected: Bool
+    let action: () -> Void
+
+    @State private var hovering = false
+
+    private var name: String {
+        if ProfileStore.isPlaceholderName(profile.name), let real = identity?.displayName {
+            return real
+        }
+        return profile.name
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                AppIconThumb(icon: identity?.icon, name: name, size: 26, corner: 6)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(name).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                    Text(profile.bundleID.isEmpty ? "Not configured" : profile.bundleID)
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+
+                Spacer(minLength: 4)
+
+                if selected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 12)).foregroundStyle(Design.accentSolid)
+                } else if !profile.missingFiles.isEmpty {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10)).foregroundStyle(Design.warning)
+                        .help("\(profile.missingFiles.joined(separator: " and ")) missing on disk")
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(selected ? Design.accentSolid.opacity(0.12)
+                          : Color.primary.opacity(hovering ? 0.06 : 0)),
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.1), value: hovering)
+    }
+}
+
+/// The footer action that mints a fresh client.
+private struct NewClientRow: View {
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Design.hairline, style: StrokeStyle(lineWidth: 1, dash: [3, 2]))
+                        .frame(width: 26, height: 26)
+                    Image(systemName: "plus")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Design.accentSolid)
+                }
+                Text("New client").font(.system(size: 12, weight: .medium))
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color.primary.opacity(hovering ? 0.06 : 0)),
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(6)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.1), value: hovering)
     }
 }

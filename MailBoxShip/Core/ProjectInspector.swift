@@ -236,10 +236,12 @@ enum ProjectInspector {
     /// the leftovers are asked for separately below.
     static func inspect(projectPath: String, scheme: String) async -> Info {
         var info = Info()
+        var hostCameFromScheme = false
 
         var entries = await buildSettings(
             container: container(forProjectPath: projectPath).arguments,
             selecting: ["-scheme", scheme])
+        let schemeTargets = Set(entries.compactMap { $0["target"] as? String })
         entries += await settingsForTargetsMissing(from: entries, projectPath: projectPath)
 
         guard !entries.isEmpty else { return info }
@@ -278,7 +280,17 @@ enum ProjectInspector {
                 info.entitlements[bundle] = generated
             }
 
-            if wrapper == "app" || (info.bundleID.isEmpty && wrapper.isEmpty) {
+            // A watchOS app is an application too: it reports ".app" exactly as
+            // its host does, so wrapper alone cannot tell the two apart and the
+            // watch app — always a leftover, never named by the phone app's
+            // scheme — would land in `info.bundleID` simply by being read last.
+            // The scheme is the tiebreak: it names the app being shipped, and
+            // the leftovers are read to cover what that app embeds. So once the
+            // scheme has produced a host, only the scheme may replace it.
+            let fromScheme = (entry["target"] as? String).map(schemeTargets.contains) ?? false
+            let isHost = wrapper == "app" || (info.bundleID.isEmpty && wrapper.isEmpty)
+            if isHost, fromScheme || !hostCameFromScheme {
+                hostCameFromScheme = fromScheme
                 info.bundleID = bundle
                 info.marketingVersion = settings["MARKETING_VERSION"] as? String ?? ""
                 info.buildNumber = settings["CURRENT_PROJECT_VERSION"] as? String ?? ""
