@@ -16,7 +16,8 @@ import CryptoKit
 struct ASCClient {
     let keyID: String
     let issuerID: String
-    /// Path only. The key is read at the moment of signing and never retained.
+    /// Path only. The key is read at the moment of signing and never r
+    /// etained.
     let privateKeyPath: String
     /// Pre-resolved proxy settings, if the network requires one.
     var proxyDictionary: [AnyHashable: Any]?
