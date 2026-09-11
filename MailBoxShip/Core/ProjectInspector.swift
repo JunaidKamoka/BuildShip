@@ -237,6 +237,8 @@ enum ProjectInspector {
     static func inspect(projectPath: String, scheme: String) async -> Info {
         var info = Info()
         var hostCameFromScheme = false
+        /// Bundle ids whose settings came from the scheme's own targets.
+        var settingsCameFromScheme: Set<String> = []
 
         var entries = await buildSettings(
             container: container(forProjectPath: projectPath).arguments,
@@ -266,18 +268,31 @@ enum ProjectInspector {
             // The wrapper extension distinguishes the app from what it embeds:
             // ".app" for the host, ".appex" for extensions.
             let wrapper = settings["WRAPPER_EXTENSION"] as? String ?? ""
+            let fromScheme = (entry["target"] as? String).map(schemeTargets.contains) ?? false
 
-            info.buildSettings[bundle] = settings.compactMapValues { $0 as? String }
+            // Two targets may share one bundle id: an iPhone app and a Mac app
+            // under a single App Store record is exactly that, and it is what
+            // universal purchase requires. These maps are keyed by identifier,
+            // so without a tiebreak the leftover target overwrites the one the
+            // scheme actually builds — and the run then reads the other
+            // platform's SUPPORTED_PLATFORMS and the other target's
+            // entitlements. Same rule as the host below: once the scheme has
+            // spoken for an identifier, only the scheme may replace it.
+            let alreadyFromScheme = settingsCameFromScheme.contains(bundle) && !fromScheme
+            if !alreadyFromScheme {
+                if fromScheme { settingsCameFromScheme.insert(bundle) }
+                info.buildSettings[bundle] = settings.compactMapValues { $0 as? String }
 
-            // xcodebuild reports CODE_SIGN_ENTITLEMENTS relative to the project
-            // directory; resolve it so the file can actually be read.
-            if let relative = settings["CODE_SIGN_ENTITLEMENTS"] as? String, !relative.isEmpty {
-                let root = (projectPath as NSString).deletingLastPathComponent
-                info.entitlements[bundle] = relative.hasPrefix("/")
-                    ? relative
-                    : (root as NSString).appendingPathComponent(relative)
-            } else if let generated = synthesizedEntitlements(forBundle: bundle, settings: settings) {
-                info.entitlements[bundle] = generated
+                // xcodebuild reports CODE_SIGN_ENTITLEMENTS relative to the project
+                // directory; resolve it so the file can actually be read.
+                if let relative = settings["CODE_SIGN_ENTITLEMENTS"] as? String, !relative.isEmpty {
+                    let root = (projectPath as NSString).deletingLastPathComponent
+                    info.entitlements[bundle] = relative.hasPrefix("/")
+                        ? relative
+                        : (root as NSString).appendingPathComponent(relative)
+                } else if let generated = synthesizedEntitlements(forBundle: bundle, settings: settings) {
+                    info.entitlements[bundle] = generated
+                }
             }
 
             // A watchOS app is an application too: it reports ".app" exactly as
@@ -287,7 +302,6 @@ enum ProjectInspector {
             // The scheme is the tiebreak: it names the app being shipped, and
             // the leftovers are read to cover what that app embeds. So once the
             // scheme has produced a host, only the scheme may replace it.
-            let fromScheme = (entry["target"] as? String).map(schemeTargets.contains) ?? false
             let isHost = wrapper == "app" || (info.bundleID.isEmpty && wrapper.isEmpty)
             if isHost, fromScheme || !hostCameFromScheme {
                 hostCameFromScheme = fromScheme
