@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/macbook/Documents/MailBoxShip/**)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import jwt; print\\('pyjwt ok'\\)\")",
+      "Bash(python3 -c \"import cryptography; print\\('cryptography ok', cryptography.__version__\\)\")",
+      "Bash(defaults read *)",
+      "Bash(xcodebuild -project MailBoxShip.xcodeproj -scheme MailBoxShip -configuration Debug -destination 'generic/platform=macOS' build)"
+    ]
+  }
+}
