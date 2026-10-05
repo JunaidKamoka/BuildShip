@@ -71,6 +71,24 @@ enum ProjectInspector {
         /// what those are worth.
         var buildSettings: [String: [String: String]] = [:]
 
+        /// Whether the app this scheme builds can be shipped as `platform`, or
+        /// nil when the project has not said. The same test the pipeline makes
+        /// before touching the account: SUPPORTED_PLATFORMS for the SDK family,
+        /// and the target's own Catalyst flags to tell the two Mac kinds apart.
+        func canBuild(_ platform: ShipPlatform) -> Bool? {
+            let settings = buildSettings[bundleID] ?? [:]
+            let supported = (settings["SUPPORTED_PLATFORMS"] ?? "").lowercased()
+            guard !supported.isEmpty else { return nil }
+            let catalyst = ["IS_MACCATALYST", "SUPPORTS_MACCATALYST"]
+                .contains { settings[$0]?.uppercased() == "YES" }
+            guard supported.contains(platform.supportedPlatformName) else { return false }
+            switch platform {
+            case .iOS: return true
+            case .macOS: return !catalyst
+            case .macCatalyst: return catalyst
+            }
+        }
+
         var summary: String {
             var parts: [String] = []
             parts.append("\(schemes.count) scheme\(schemes.count == 1 ? "" : "s")")
@@ -346,12 +364,74 @@ enum ProjectInspector {
         // correct that once the host is known.
         info.extensionBundleIDs.removeAll { $0 == info.bundleID }
 
+        // The leftovers come from the whole project, not just this app. A
+        // project shipping an iPhone app, its Watch app and a Mac app under one
+        // record (universal purchase) has all three as targets, and without
+        // this the Mac scheme reported the Watch app as one of its extensions —
+        // a Mac upload would then try to register and sign a watchOS bundle it
+        // never contains. A target only counts if it can be embedded in an app
+        // of the host's platform.
+        if let host = info.platform {
+            info.extensionBundleIDs.removeAll { bundle in
+                guard let settings = info.buildSettings[bundle] else { return false }
+                return !embeddable(settings, in: host)
+            }
+        }
+
         // Unresolved variables are worse than blank — they look like real
         // values and fail at signing.
         if info.marketingVersion.contains("$") { info.marketingVersion = "" }
         if info.buildNumber.contains("$") { info.buildNumber = "" }
 
         return info
+    }
+
+    /// Whether a target with these settings can ship inside an app built for
+    /// `host`. iPhone apps carry their extensions and their Watch app; a Mac
+    /// app only Mac code; a Catalyst app its iOS extensions rebuilt for the Mac.
+    /// A target that names no SDK is given the benefit of the doubt.
+    private static func embeddable(_ settings: [String: String], in host: ShipPlatform) -> Bool {
+        let sdk = (settings["SDKROOT"] ?? settings["PLATFORM_NAME"] ?? "").lowercased()
+        guard !sdk.isEmpty else { return true }
+        switch host {
+        case .iOS: return sdk.contains("iphone") || sdk.contains("watch")
+        case .macOS: return sdk.contains("macosx")
+        case .macCatalyst: return sdk.contains("iphone") || sdk.contains("macosx")
+        }
+    }
+
+    /// Another scheme in the project that builds the same app for `platform`.
+    ///
+    /// Universal purchase is usually two schemes — "App" for the iPhone and
+    /// "AppMac" for the Mac — sharing one bundle id. Choosing macOS while the
+    /// iPhone scheme is selected cannot work, but the fix is not the user's to
+    /// discover: the sibling is sitting in the scheme list. Schemes whose name
+    /// suggests the platform are asked first, so the usual case costs one read.
+    static func scheme(
+        building bundleID: String, for platform: ShipPlatform,
+        among schemes: [String], excluding current: String, projectPath: String,
+    ) async -> (scheme: String, info: Info)? {
+        let hints: [String] = switch platform {
+        case .macOS: ["macos", "mac", "osx", "desktop"]
+        case .macCatalyst: ["catalyst", "mac"]
+        case .iOS: ["ios", "iphone", "ipad", "mobile"]
+        }
+        func hinted(_ name: String) -> Bool {
+            let lower = name.lowercased()
+            return hints.contains { lower.contains($0) }
+        }
+        let candidates = schemes.filter { $0 != current }
+            .sorted { hinted($0) && !hinted($1) }
+        for candidate in candidates {
+            let info = await inspect(projectPath: projectPath, scheme: candidate)
+            guard !info.bundleID.isEmpty,
+                  bundleID.isEmpty || info.bundleID == bundleID
+            else { continue }
+            if info.platform == platform || (info.platform == nil && info.canBuild(platform) == true) {
+                return (candidate, info)
+            }
+        }
+        return nil
     }
 
     /// `-showBuildSettings -json`, decoded, for whatever selects the targets.

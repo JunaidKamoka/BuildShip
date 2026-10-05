@@ -693,11 +693,21 @@ struct Pipeline {
         }
         if !supported.isEmpty, !canBuild(input.platform) {
             let buildable = ShipPlatform.allCases.filter(canBuild)
+            // The usual cause is the other half of a universal-purchase app: the
+            // iPhone scheme selected while shipping the Mac app. Name the scheme
+            // that does build it, rather than leaving that to be guessed.
+            let (schemes, _) = await ProjectInspector.list(projectPath: input.projectPath)
+            let sibling = await ProjectInspector.scheme(
+                building: input.bundleID, for: input.platform,
+                among: schemes, excluding: input.scheme, projectPath: input.projectPath)
             throw ShipError(
                 "Scheme \(input.scheme) cannot build for \(input.platform.displayName)"
                 + (buildable.isEmpty ? "." : " — it builds for "
                    + buildable.map(\.displayName).joined(separator: " and ") + ".")
-                + " Set “Upload as” accordingly. Nothing was created on your account.")
+                + (sibling.map { " Scheme \($0.scheme) builds \(input.bundleID) for "
+                    + "\(input.platform.displayName): choose it as the Scheme." }
+                   ?? " Set “Upload as” accordingly.")
+                + " Nothing was created on your account.")
         }
 
         let unknown = input.extensionBundleIDs.filter { !info.extensionBundleIDs.contains($0) }

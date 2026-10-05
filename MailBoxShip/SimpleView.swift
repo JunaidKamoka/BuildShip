@@ -52,8 +52,50 @@ struct SimpleView: View {
     private var platformBinding: Binding<ShipPlatform> {
         Binding(
             get: { selectedPlatform },
-            set: { store.binding(\.platformRaw).wrappedValue = $0.rawValue },
+            set: { platform in
+                store.binding(\.platformRaw).wrappedValue = platform.rawValue
+                Task { await reconcileScheme(with: platform) }
+            },
         )
+    }
+
+    /// Whether the scheme as detected can ship as `platform`.
+    private func schemeBuilds(_ platform: ShipPlatform) -> Bool {
+        detected.platform == platform || detected.canBuild(platform) == true
+    }
+
+    /// When the selected scheme cannot build the chosen platform, switch to the
+    /// project's scheme that builds the same app for it — the iPhone and Mac
+    /// halves of a universal-purchase app are usually two schemes.
+    private func reconcileScheme(with platform: ShipPlatform) async {
+        guard !detecting, !detected.schemes.isEmpty, detected.platform != nil,
+              !schemeBuilds(platform) else { return }
+        let path = store.current.projectPath
+        let current = store.current.scheme
+        let builtFor = detected.platform?.displayName ?? "another platform"
+
+        detecting = true
+        note = "Looking for the scheme that builds \(platform.displayName)…"; noteWarn = false
+        let found = await ProjectInspector.scheme(
+            building: detected.bundleID, for: platform,
+            among: detected.schemes, excluding: current, projectPath: path)
+        detecting = false
+
+        guard let found, store.current.projectPath == path else {
+            note = "Scheme \(current) builds for \(builtFor), and no other scheme here builds this app for \(platform.displayName)."
+            noteWarn = true
+            return
+        }
+        store.binding(\.scheme).wrappedValue = found.scheme
+        var info = found.info
+        info.schemes = detected.schemes
+        detected = info
+        store.binding(\.detectedPlatformRaw).wrappedValue = platform.rawValue
+        store.binding(\.platformRaw).wrappedValue = ""
+        store.binding(\.bundleID).wrappedValue = info.bundleID
+        store.binding(\.extensionBundleIDsRaw).wrappedValue = info.extensionBundleIDs.joined(separator: ", ")
+        note = "Ready: \(found.scheme) for \(platform.displayName) · \(info.summary)"
+        noteWarn = false
     }
 
     var body: some View {
@@ -164,7 +206,7 @@ struct SimpleView: View {
                     .foregroundStyle(Design.accent)
                 Text("Detected automatically").font(.system(size: 12, weight: .semibold))
                 Spacer()
-                if detecting { ProgressView().controlSize(.small).scaleEffect(0.7) }
+                if detecting { InlineSpinner(size: 11) }
             }
 
             WrapChips {
@@ -379,7 +421,7 @@ struct SimpleView: View {
             if !runner.steps.isEmpty { stageStrip }
 
             HStack(spacing: 6) {
-                if runner.isRunning { ProgressView().controlSize(.small).scaleEffect(0.7) }
+                if runner.isRunning { InlineSpinner(size: 11) }
                 Text(runner.status)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(runner.failed ? Design.failure
@@ -401,7 +443,7 @@ struct SimpleView: View {
                     Circle().fill(state.tint.opacity(state == .pending ? 0.12 : 0.18))
                         .frame(width: 20, height: 20)
                     if state == .active {
-                        ProgressView().controlSize(.small).scaleEffect(0.5)
+                        InlineSpinner(size: 8)
                     } else {
                         Image(systemName: state == .done ? "checkmark"
                               : state == .failed ? "xmark" : stage.symbol)
@@ -512,6 +554,12 @@ struct SimpleView: View {
         // before it has had time to read the project again.
         if let platform = info.platform {
             store.binding(\.detectedPlatformRaw).wrappedValue = platform.rawValue
+        }
+
+        // A platform chosen earlier that this scheme cannot build: switch to
+        // the scheme that does, once this detection has settled.
+        if let chosen = store.current.platformOverride, !schemeBuilds(chosen) {
+            Task { await reconcileScheme(with: chosen) }
         }
 
         // The simple screen has no bundle-id field to reconcile, so it trusts

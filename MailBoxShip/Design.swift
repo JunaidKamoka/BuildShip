@@ -505,3 +505,25 @@ struct QuietButton: View {
         .animation(.easeOut(duration: 0.12), value: hovering)
     }
 }
+
+/// A small activity indicator drawn in SwiftUI.
+///
+/// The AppKit-backed `ProgressView`, shrunk with `scaleEffect` to sit beside a
+/// label, logs "has a maximum length … that doesn't satisfy min <= max" on
+/// every layout pass — its intrinsic size and the scaled frame disagree by a
+/// rounding error. This one has no intrinsic size to disagree with.
+struct InlineSpinner: View {
+    var size: CGFloat = 11
+    @State private var spinning = false
+
+    var body: some View {
+        Circle()
+            .trim(from: 0.15, to: 1)
+            .stroke(Color.secondary, style: StrokeStyle(lineWidth: max(1.2, size / 7), lineCap: .round))
+            .frame(width: size, height: size)
+            .rotationEffect(.degrees(spinning ? 360 : 0))
+            .animation(.linear(duration: 0.8).repeatForever(autoreverses: false), value: spinning)
+            .onAppear { spinning = true }
+            .accessibilityLabel("Working")
+    }
+}
