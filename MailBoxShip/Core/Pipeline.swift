@@ -2017,25 +2017,54 @@ struct Pipeline {
         }
     }
 
-    /// Write the version and build number into the archive itself.
+    /// Write the version and build number into the archive itself, and bring
+    /// every embedded bundle into line with the host app.
     ///
-    /// `CURRENT_PROJECT_VERSION` on the command line only reaches the built app
-    /// when its Info.plist asks for it — a generated plist, or a literal one
-    /// written as `$(CURRENT_PROJECT_VERSION)`. A project that instead hardcodes
-    /// `<string>1</string>` ignores the override completely, and nothing says
-    /// so: every rebuild ships the same number, App Store Connect rejects each
-    /// one as already used, and the automatic bump loops until it gives up
-    /// having burned a full build per attempt. Stamping the archive is the one
-    /// place that works whatever the project does.
+    /// Two separate failures live here.
+    ///
+    /// The first is the *override*. `CURRENT_PROJECT_VERSION` on the command
+    /// line only reaches the built app when its Info.plist asks for it — a
+    /// generated plist, or a literal one written as `$(CURRENT_PROJECT_VERSION)`.
+    /// A project that instead hardcodes `<string>1</string>` ignores the
+    /// override completely, and nothing says so: every rebuild ships the same
+    /// number, App Store Connect rejects each one as already used, and the
+    /// automatic bump loops until it gives up having burned a full build per
+    /// attempt. Stamping the archive is the one place that works whatever the
+    /// project does.
+    ///
+    /// The second is the *embedded mismatch*. Apple refuses an upload whose
+    /// companion watch app or extension carries a different
+    /// CFBundleShortVersionString — or CFBundleVersion — from its host
+    /// ("CFBundleShortVersionString Mismatch … does not match … of its
+    /// containing iOS application"). That needs no override to happen: a watch
+    /// target that hardcodes `<string>1.0</string>` while the iOS app reads
+    /// `$(MARKETING_VERSION)` drifts apart the moment the app's version moves,
+    /// and the failure only surfaces at validation, after a full archive and
+    /// export. So even when the user set no override, the host's own built
+    /// version and build number are read back from the archive and forced onto
+    /// every embedded bundle, which is exactly what Apple requires.
     ///
     /// Safe because the archive is built unsigned and export signs it
-    /// afterwards. Extensions are stamped too — Apple rejects an upload whose
-    /// extension build number differs from its host app's.
+    /// afterwards.
     private func stampVersion(
         inArchiveAt archive: String, buildNumber: String, marketingVersion: String,
     ) {
-        guard !buildNumber.isEmpty || !marketingVersion.isEmpty else { return }
+        // With no override, follow the host app's own built values so the watch
+        // app and extensions are normalised to it rather than left to drift.
+        let hostPlist = hostAppPlist(inArchiveAt: archive)
+        var hostShort = "", hostBuild = ""
+        if let hostPlist, let data = FileManager.default.contents(atPath: hostPlist),
+           let plist = try? PropertyListSerialization.propertyList(
+               from: data, format: nil) as? [String: Any] {
+            hostShort = plist["CFBundleShortVersionString"] as? String ?? ""
+            hostBuild = plist["CFBundleVersion"] as? String ?? ""
+        }
+        let shortVersion = marketingVersion.isEmpty ? hostShort : marketingVersion
+        let build = buildNumber.isEmpty ? hostBuild : buildNumber
 
+        guard !build.isEmpty || !shortVersion.isEmpty else { return }
+
+        var normalised: [String] = []
         for path in bundleRootInfoPlists(inArchiveAt: archive) {
             var format = PropertyListSerialization.PropertyListFormat.xml
             guard let data = FileManager.default.contents(atPath: path),
@@ -2043,15 +2072,61 @@ struct Pipeline {
                       from: data, format: &format) as? [String: Any]
             else { continue }
 
-            if !buildNumber.isEmpty { plist["CFBundleVersion"] = buildNumber }
-            if !marketingVersion.isEmpty {
-                plist["CFBundleShortVersionString"] = marketingVersion
-            }
+            let hadShort = plist["CFBundleShortVersionString"] as? String
+            let hadBuild = plist["CFBundleVersion"] as? String
+            if !build.isEmpty { plist["CFBundleVersion"] = build }
+            if !shortVersion.isEmpty { plist["CFBundleShortVersionString"] = shortVersion }
+            let changed = hadShort != (plist["CFBundleShortVersionString"] as? String)
+                || hadBuild != (plist["CFBundleVersion"] as? String)
+
             if let updated = try? PropertyListSerialization.data(
                 fromPropertyList: plist, format: format, options: 0) {
                 try? updated.write(to: URL(fileURLWithPath: path))
+                // Report only the embedded bundles we had to move — the host
+                // already holds these values, so it never appears here.
+                if changed, path != hostPlist {
+                    normalised.append(bundleName(ofRootPlist: path))
+                }
             }
         }
+
+        if !normalised.isEmpty {
+            let stamp = [shortVersion, build.isEmpty ? "" : "build \(build)"]
+                .filter { !$0.isEmpty }.joined(separator: ", ")
+            log("  Matched \(normalised.joined(separator: ", ")) to the app's version "
+                + "(\(stamp)) so the upload isn't rejected for a version mismatch\n")
+        }
+    }
+
+    /// The host app's own root Info.plist inside the archive — the top-level
+    /// `.app` whose bundle id is the one being shipped. Embedded bundles and
+    /// stray products are passed over; their versions must follow this one.
+    private func hostAppPlist(inArchiveAt archive: String) -> String? {
+        let root = (archive as NSString).appendingPathComponent("Products/Applications")
+        let apps = ((try? FileManager.default.contentsOfDirectory(atPath: root)) ?? [])
+            .filter { $0.hasSuffix(".app") }.sorted()
+
+        func plistPath(forAppNamed name: String) -> String? {
+            let base = (root as NSString).appendingPathComponent(name)
+            for candidate in [base + "/Info.plist", base + "/Contents/Info.plist"]
+            where FileManager.default.fileExists(atPath: candidate) { return candidate }
+            return nil
+        }
+
+        let host = apps.first {
+            plistPath(forAppNamed: $0).flatMap(bundleIdentifier(atPlist:)) == input.bundleID
+        } ?? (apps.count == 1 ? apps.first : nil)
+        return host.flatMap(plistPath(forAppNamed:))
+    }
+
+    /// A readable name for the bundle a root Info.plist belongs to, e.g.
+    /// "Printer.app" — the directory holding it, or holding its `Contents`.
+    private func bundleName(ofRootPlist path: String) -> String {
+        let directory = (path as NSString).deletingLastPathComponent as NSString
+        if directory.lastPathComponent == "Contents" {
+            return (directory.deletingLastPathComponent as NSString).lastPathComponent
+        }
+        return directory.lastPathComponent
     }
 
     /// Give a Mac app a category when it doesn't declare one.
