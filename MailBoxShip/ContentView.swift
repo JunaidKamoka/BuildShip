@@ -329,7 +329,7 @@ struct AdvancedView: View {
                 Task { await detect() }
             } label: {
                 HStack(spacing: 4) {
-                    if detecting { ProgressView().controlSize(.small).scaleEffect(0.7) }
+                    if detecting { InlineSpinner(size: 11) }
                     else { Image(systemName: "arrow.clockwise").font(.system(size: 10)) }
                     Text("Detect").font(.system(size: 11))
                 }
@@ -575,7 +575,7 @@ struct AdvancedView: View {
                 Task { await loadTestFlight() }
             } label: {
                 HStack(spacing: 4) {
-                    if loadingTestFlight { ProgressView().controlSize(.small).scaleEffect(0.7) }
+                    if loadingTestFlight { InlineSpinner(size: 11) }
                     else { Image(systemName: "arrow.clockwise").font(.system(size: 10)) }
                     Text("Refresh").font(.system(size: 11))
                 }
@@ -848,7 +848,7 @@ struct AdvancedView: View {
                             .fill(state.tint.opacity(state == .pending ? 0.12 : 0.18))
                             .frame(width: 22, height: 22)
                         if state == .active {
-                            ProgressView().controlSize(.small).scaleEffect(0.55)
+                            InlineSpinner(size: 9)
                         } else {
                             Image(systemName: state == .done ? "checkmark"
                                   : state == .failed ? "xmark" : stage.symbol)
@@ -962,6 +962,17 @@ struct AdvancedView: View {
         // before it has had time to read the project again.
         if let platform = info.platform {
             store.binding(\.detectedPlatformRaw).wrappedValue = platform.rawValue
+        }
+
+        // A platform chosen earlier that this scheme cannot build. Picking the
+        // scheme by hand is the newer decision, so the platform follows it;
+        // otherwise the scheme follows the platform once detection settles.
+        if let chosen = store.current.platformOverride, !schemeBuilds(chosen) {
+            if adopting {
+                store.binding(\.platformRaw).wrappedValue = ""
+            } else {
+                Task { await reconcileScheme(with: chosen) }
+            }
         }
 
         if adopting, !info.bundleID.isEmpty {
@@ -1105,8 +1116,64 @@ struct AdvancedView: View {
     private var platformBinding: Binding<ShipPlatform> {
         Binding(
             get: { selectedPlatform },
-            set: { store.binding(\.platformRaw).wrappedValue = $0.rawValue },
+            set: { choose($0) },
         )
+    }
+
+    /// The platform picker. The choice is kept as an override, and when the
+    /// selected scheme cannot build it the scheme follows — see
+    /// `reconcileScheme(with:)`.
+    private func choose(_ platform: ShipPlatform) {
+        store.binding(\.platformRaw).wrappedValue = platform.rawValue
+        Task { await reconcileScheme(with: platform) }
+    }
+
+    /// Whether the scheme as detected can ship as `platform`: what it builds,
+    /// or a multiplatform target whose supported platforms include it.
+    private func schemeBuilds(_ platform: ShipPlatform) -> Bool {
+        detected.platform == platform || detected.canBuild(platform) == true
+    }
+
+    /// Switches to the scheme that builds this app for `platform` when the
+    /// selected one cannot.
+    ///
+    /// Universal purchase is normally two schemes sharing one bundle id — the
+    /// iPhone app and the Mac app — and picking macOS with the iPhone scheme
+    /// selected used to be left standing until the run refused it at the first
+    /// step. The sibling is in the scheme list, so the choice is carried
+    /// through: the scheme changes, and with it the bundle id and the
+    /// extensions (an iPhone scheme's Watch app is no part of the Mac upload).
+    private func reconcileScheme(with platform: ShipPlatform) async {
+        guard !detecting, !detected.schemes.isEmpty, detected.platform != nil,
+              !schemeBuilds(platform) else { return }
+        let path = store.current.projectPath
+        let current = store.current.scheme
+        let builtFor = detected.platform?.displayName ?? "another platform"
+
+        detecting = true
+        detectionWarning = false
+        detectionNote = "Looking for the scheme that builds \(platform.displayName)…"
+        let found = await ProjectInspector.scheme(
+            building: detected.bundleID, for: platform,
+            among: detected.schemes, excluding: current, projectPath: path)
+        detecting = false
+
+        guard let found, store.current.projectPath == path else {
+            detectionWarning = true
+            detectionNote = "Scheme \(current) builds for \(builtFor), and no other scheme here builds "
+                + "\(detected.bundleID.isEmpty ? "this app" : detected.bundleID) for \(platform.displayName)."
+            return
+        }
+
+        store.binding(\.scheme).wrappedValue = found.scheme
+        var info = found.info
+        info.schemes = detected.schemes
+        detected = info
+        store.binding(\.detectedPlatformRaw).wrappedValue = platform.rawValue
+        // The platform is now simply what the scheme builds.
+        store.binding(\.platformRaw).wrappedValue = ""
+        adoptDetectedIdentifiers()
+        detectionNote = "Switched to scheme \(found.scheme) for \(platform.displayName) · \(info.summary)"
     }
 
     private func start(upload: Bool) {

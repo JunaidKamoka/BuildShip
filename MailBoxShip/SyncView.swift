@@ -26,7 +26,7 @@ struct SyncView: View {
 
             if !sync.status.isEmpty {
                 HStack(spacing: 6) {
-                    if sync.busy { ProgressView().controlSize(.small).scaleEffect(0.7) }
+                    if sync.busy { InlineSpinner(size: 11) }
                     Text(sync.status)
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
