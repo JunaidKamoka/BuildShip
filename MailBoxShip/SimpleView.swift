@@ -10,7 +10,9 @@ import UniformTypeIdentifiers
 /// every knob; this one is the path most runs actually take.
 struct SimpleView: View {
     @ObservedObject var store: ProfileStore
+    /// The selected client's runner. Other clients' runs carry on in `runs`.
     @ObservedObject var runner: Runner
+    @ObservedObject var runs: RunCenter
     @ObservedObject var sync: SyncStore
     var onAdvanced: () -> Void
 
@@ -26,6 +28,7 @@ struct SimpleView: View {
     @State private var team = ""
     @State private var copiedLog = false
     @State private var showSync = false
+    @State private var showShipMany = false
     /// Checked once rather than per render — it is a handful of filesystem
     /// probes, and a view body is not the place for them.
     @State private var uploaderInstalled = true
@@ -41,11 +44,16 @@ struct SimpleView: View {
     /// checks is saved, so the button is otherwise live the instant the window
     /// opens — and a run started there is built from whatever the *previous*
     /// project left in state.
-    private var ready: Bool { problems.isEmpty && !runner.isRunning && !detecting }
+    private var ready: Bool { problems.isEmpty && !runner.isBusy && !detecting }
 
     /// The platform this run ships as: the user's explicit choice, else whatever
     /// the project detected. What actually gets built and uploaded.
     private var selectedPlatform: ShipPlatform { p.shipPlatform(detected: detected.platform) }
+
+    /// What the scheme embeds when built for the platform this run ships as.
+    private var shippedExtensions: [String] {
+        detected.extensionBundleIDs(shippingAs: selectedPlatform)
+    }
 
     /// Writes the segmented picker's choice back to the profile as an explicit
     /// override, so it persists and the other platform can be shipped next time.
@@ -54,6 +62,12 @@ struct SimpleView: View {
             get: { selectedPlatform },
             set: { platform in
                 store.binding(\.platformRaw).wrappedValue = platform.rawValue
+                // Same scheme, other platform: a different set of embedded
+                // targets — the iPhone build's Watch app is not in a Mac one.
+                if schemeBuilds(platform), !detected.bundleID.isEmpty {
+                    store.binding(\.extensionBundleIDsRaw).wrappedValue =
+                        detected.extensionBundleIDs(shippingAs: platform).joined(separator: ", ")
+                }
                 Task { await reconcileScheme(with: platform) }
             },
         )
@@ -93,7 +107,8 @@ struct SimpleView: View {
         store.binding(\.detectedPlatformRaw).wrappedValue = platform.rawValue
         store.binding(\.platformRaw).wrappedValue = ""
         store.binding(\.bundleID).wrappedValue = info.bundleID
-        store.binding(\.extensionBundleIDsRaw).wrappedValue = info.extensionBundleIDs.joined(separator: ", ")
+        store.binding(\.extensionBundleIDsRaw).wrappedValue =
+            info.extensionBundleIDs(shippingAs: platform).joined(separator: ", ")
         note = "Ready: \(found.scheme) for \(platform.displayName) · \(info.summary)"
         noteWarn = false
     }
@@ -111,7 +126,14 @@ struct SimpleView: View {
                         ResultCard(result: result)
                             .transition(.opacity.combined(with: .move(edge: .top)))
                     }
-                    if runner.isRunning || runner.finished || !runner.log.isEmpty { progress }
+                    if runner.isBusy || runner.finished || !runner.log.isEmpty { progress }
+                    // Everything else building, waiting or done — the app on
+                    // screen is shown in full above, so it is left out here.
+                    if runs.recent.contains(where: { $0 != p.id }) {
+                        ActivityPanel(store: store, runs: runs, identities: identities,
+                                      title: "Other apps", excluding: p.id)
+                            .cardSurface(padding: 12)
+                    }
                 }
                 .frame(maxWidth: 560)
                 .frame(maxWidth: .infinity)
@@ -132,6 +154,9 @@ struct SimpleView: View {
             await fetchTeam()
         }
         .sheet(isPresented: $showSync) { SyncView(sync: sync) }
+        .sheet(isPresented: $showShipMany) {
+            ShipManyView(store: store, runs: runs, identities: identities) { showShipMany = false }
+        }
     }
 
     // MARK: - Top bar
@@ -153,14 +178,16 @@ struct SimpleView: View {
 
             Spacer()
 
-            ClientSwitcher(store: store, identities: identities, disabled: runner.isRunning)
+            // Never locked by a run: each client has its own, so the next one
+            // can be set up and deployed while this one builds.
+            ClientSwitcher(store: store, identities: identities, runs: runs)
 
             QuietButton(title: "Builds", symbol: "tray.full") { Builds.open() }
                 .help("Open the folder every finished build is kept in")
             QuietButton(title: "Sync", symbol: "arrow.triangle.2.circlepath") { showSync = true }
                 .help("Sync profiles and keys across your Macs")
             QuietButton(title: "Advanced", symbol: "slider.horizontal.3",
-                        enabled: !runner.isRunning, action: onAdvanced)
+                        enabled: !runner.isBusy, action: onAdvanced)
                 .help("Open the full interface with every option")
         }
         .padding(.horizontal, 18)
@@ -216,9 +243,15 @@ struct SimpleView: View {
                 if !displayVersion.isEmpty {
                     chip(icon: "number", text: "v\(displayVersion) (\(displayBuild))", good: true)
                 }
-                if !detected.extensionBundleIDs.isEmpty {
+                if !shippedExtensions.isEmpty {
                     chip(icon: "puzzlepiece.extension",
-                         text: "+\(detected.extensionBundleIDs.count) extension", good: true)
+                         text: "+\(shippedExtensions.count) extension", good: true)
+                }
+                // iPad is not a platform of its own: an iOS build runs on
+                // whichever devices the target names.
+                if selectedPlatform == .iOS, !detected.deviceFamilies.isEmpty {
+                    chip(icon: detected.deviceFamilies.contains("iPad") ? "ipad.and.iphone" : "iphone",
+                         text: detected.deviceFamilies.joined(separator: " + "), good: true)
                 }
                 chip(icon: "key", text: p.keyID.isEmpty ? "no key id" : p.keyID,
                      good: p.keyID.count == 10)
@@ -226,6 +259,7 @@ struct SimpleView: View {
             }
 
             platformRow
+            versionsRow
             uploaderRow
             if Deployment.proxyConfigured { proxyRow }
 
@@ -259,9 +293,24 @@ struct SimpleView: View {
             .labelsHidden()
             .pickerStyle(.segmented)
             .fixedSize()
-            .disabled(runner.isRunning)
+            .disabled(runner.isBusy)
             if p.platformOverride == nil {
                 Text("detected").font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+    }
+
+    /// This app's other platform versions, one click away, and the platforms
+    /// it does not have yet behind "Add platform".
+    private var versionsRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "square.on.square").font(.system(size: 11))
+                .foregroundStyle(Design.accent)
+            Text("Versions").font(.system(size: 11)).foregroundStyle(.secondary)
+            VersionTabs(store: store, runs: runs, currentPlatform: selectedPlatform,
+                        canAdd: !detecting) { platform in
+                Task { await addPlatformVersion(platform) }
             }
             Spacer()
         }
@@ -343,7 +392,7 @@ struct SimpleView: View {
                 Button("Change") { editingIssuer = true }
                     .buttonStyle(.borderless)
                     .controlSize(.small)
-                    .disabled(runner.isRunning)
+                    .disabled(runner.isBusy)
             }
         }
     }
@@ -373,7 +422,7 @@ struct SimpleView: View {
                 }
             }
             .controlSize(.small)
-            .disabled(runner.isRunning)
+            .disabled(runner.isBusy)
             .help("Rotate to a fresh stable exit IP")
         }
     }
@@ -383,8 +432,8 @@ struct SimpleView: View {
     private var actions: some View {
         VStack(spacing: 8) {
             PrimaryButton(
-                title: runner.isRunning ? "Working…" : "Deploy to App Store",
-                symbol: runner.isRunning ? "hourglass" : "arrow.up.circle.fill",
+                title: runner.isQueued ? "Queued…" : runner.isRunning ? "Working…" : "Deploy to App Store",
+                symbol: runner.isBusy ? "hourglass" : "arrow.up.circle.fill",
                 enabled: ready,
             ) { deploy(upload: true) }
 
@@ -400,11 +449,32 @@ struct SimpleView: View {
                 .buttonStyle(.borderless)
                 .disabled(!ready)
 
+                // Next to the button it extends, where it is looked for.
+                Button {
+                    showShipMany = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "square.stack.3d.up").font(.system(size: 10))
+                        Text(runs.busyCount > 0
+                             ? "Deploy several apps… (\(runs.busyCount) going)"
+                             : "Deploy several apps…")
+                            .font(.system(size: 11))
+                    }
+                }
+                .buttonStyle(.borderless)
+                .padding(.leading, 10)
+                .help("Tick several apps — or this app's iPhone and Mac versions — and deploy "
+                      + "them together, up to \(runs.limit) at once")
+
                 Spacer()
 
-                if !ready, bothChosen, let first = problems.first {
+                if runner.isQueued {
+                    Button("Cancel queued run") { runs.cancelQueued(p.id) }
+                        .buttonStyle(.borderless)
+                        .font(.system(size: 11))
+                } else if !ready, bothChosen, let first = problems.first {
                     Text(first).font(.system(size: 11)).foregroundStyle(Design.warning)
-                } else if detecting, !runner.isRunning {
+                } else if detecting, !runner.isBusy {
                     // Say why the button is inert, rather than leaving a ready
                     // -looking screen with a dead button on it.
                     Text("Reading the project…").font(.system(size: 11))
@@ -422,6 +492,9 @@ struct SimpleView: View {
 
             HStack(spacing: 6) {
                 if runner.isRunning { InlineSpinner(size: 11) }
+                else if runner.isQueued {
+                    Image(systemName: "clock").font(.system(size: 11)).foregroundStyle(.secondary)
+                }
                 Text(runner.status)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(runner.failed ? Design.failure
@@ -567,7 +640,7 @@ struct SimpleView: View {
         if !info.bundleID.isEmpty {
             store.binding(\.bundleID).wrappedValue = info.bundleID
             store.binding(\.extensionBundleIDsRaw).wrappedValue =
-                info.extensionBundleIDs.joined(separator: ", ")
+                shippedExtensions.joined(separator: ", ")
             note = "Ready: \(info.summary)"
             noteWarn = false
         } else {
@@ -597,18 +670,39 @@ struct SimpleView: View {
         }
         store.markUsed()
         store.save()
-        runner.onIdentityCreated = { path in
-            store.binding(\.identityPath).wrappedValue = path
-        }
-        runner.run(
-            input: Pipeline.Input(
-                profile: store.current,
-                configuration: .release,
-                platform: selectedPlatform,
-                entitlementsByBundleID: detected.entitlements,
-            ),
-            upload: upload,
+        let id = store.current.id
+        let input = Pipeline.Input(
+            profile: store.current,
+            configuration: .release,
+            platform: selectedPlatform,
+            entitlementsByBundleID: detected.entitlements,
         )
+        // By id: by the time a new identity lands, another client may be on
+        // screen, and it belongs to the one that made it.
+        runs.submit(id, upload: upload, onIdentityCreated: { [store] path in
+            store.update(id) { $0.identityPath = path }
+        }) { _ in input }
+    }
+
+    /// A second client for this app on `platform` — see the advanced screen's
+    /// `addPlatformVersion`, which this mirrors.
+    private func addPlatformVersion(_ platform: ShipPlatform) async {
+        let source = store.current
+        guard !source.projectPath.isEmpty, !detecting else { return }
+
+        detecting = true
+        note = "Looking for the scheme that builds \(platform.displayName)…"; noteWarn = false
+        let found = detected.schemes.isEmpty ? nil : await ProjectInspector.scheme(
+            forPlatformVersion: platform, of: detected,
+            scheme: source.scheme, projectPath: source.projectPath)
+        detecting = false
+
+        store.addPlatformVersion(
+            of: source.id, platform: platform,
+            scheme: found?.scheme ?? source.scheme,
+            bundleID: found.map { $0.info.bundleID.isEmpty ? source.bundleID : $0.info.bundleID }
+                ?? source.bundleID,
+            extensions: found?.info.extensionBundleIDs(shippingAs: platform) ?? [])
     }
 }
 
@@ -759,7 +853,7 @@ private struct StepCard<Content: View>: View {
 private struct ClientSwitcher: View {
     @ObservedObject var store: ProfileStore
     @ObservedObject var identities: AppIdentityStore
-    var disabled: Bool
+    @ObservedObject var runs: RunCenter
 
     @State private var showing = false
     @State private var hovering = false
@@ -775,6 +869,14 @@ private struct ClientSwitcher: View {
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
+                PlatformMark(platform: current.knownPlatform)
+                // Runs on other clients are out of sight; say they exist.
+                let elsewhere = runs.busyCount - (runs.isBusy(current.id) ? 1 : 0)
+                if elsewhere > 0 {
+                    Text("+\(elsewhere) running")
+                        .font(Design.Face.caption)
+                        .foregroundStyle(Design.accentSolid)
+                }
                 Image(systemName: "chevron.down")
                     .font(.system(size: 8, weight: .bold)).foregroundStyle(.secondary)
             }
@@ -792,12 +894,11 @@ private struct ClientSwitcher: View {
         }
         .buttonStyle(.plain)
         .fixedSize()
-        .disabled(disabled)
-        .onHover { hovering = $0 && !disabled }
+        .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.12), value: hovering)
         .help("Switch the client app this run ships")
         .popover(isPresented: $showing, arrowEdge: .bottom) {
-            ClientList(store: store, identities: identities) { showing = false }
+            ClientList(store: store, identities: identities, runs: runs) { showing = false }
         }
     }
 
@@ -815,20 +916,20 @@ private struct ClientSwitcher: View {
 private struct ClientList: View {
     @ObservedObject var store: ProfileStore
     @ObservedObject var identities: AppIdentityStore
+    @ObservedObject var runs: RunCenter
     var dismiss: () -> Void
-
-    private var sorted: [ShipProfile] {
-        store.profiles.sorted { $0.lastUsed > $1.lastUsed }
-    }
 
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(spacing: 2) {
-                    ForEach(sorted) { profile in
+                    ForEach(store.listOrder) { entry in
+                        let profile = entry.profile
                         ClientRow(profile: profile,
                                   identity: identities.identity(for: profile),
-                                  selected: profile.id == store.selectedID) {
+                                  selected: profile.id == store.selectedID,
+                                  nested: entry.nested,
+                                  runner: runs.activity(for: profile.id)) {
                             store.selectedID = profile.id
                             dismiss()
                         }
@@ -859,6 +960,10 @@ private struct ClientRow: View {
     let profile: ShipProfile
     let identity: AppIdentity?
     let selected: Bool
+    /// Another version of the app above — indented beneath it.
+    var nested = false
+    /// Present once this client has run, so its status shows in the list.
+    let runner: Runner?
     let action: () -> Void
 
     @State private var hovering = false
@@ -873,16 +978,22 @@ private struct ClientRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 9) {
-                AppIconThumb(icon: identity?.icon, name: name, size: 26, corner: 6)
+                AppIconThumb(icon: identity?.icon, name: name,
+                             size: nested ? 20 : 26, corner: nested ? 5 : 6)
 
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(name).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                    HStack(spacing: 5) {
+                        Text(name).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                        PlatformMark(platform: profile.knownPlatform)
+                    }
                     Text(profile.bundleID.isEmpty ? "Not configured" : profile.bundleID)
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.middle)
                 }
 
                 Spacer(minLength: 4)
+
+                if let runner { RunBadge(runner: runner) }
 
                 if selected {
                     Image(systemName: "checkmark.circle.fill")
@@ -895,6 +1006,7 @@ private struct ClientRow: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
+            .padding(.leading, nested ? 16 : 0)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
                     .fill(selected ? Design.accentSolid.opacity(0.12)

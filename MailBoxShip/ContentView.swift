@@ -4,7 +4,9 @@ import UniformTypeIdentifiers
 
 struct AdvancedView: View {
     @ObservedObject var store: ProfileStore
+    /// The selected profile's runner. Other profiles' runs carry on in `runs`.
     @ObservedObject var runner: Runner
+    @ObservedObject var runs: RunCenter
     @ObservedObject var sync: SyncStore
     /// Return to the simple screen. Injected by the root so the two screens
     /// share one store and one runner — switching never loses a selection or a
@@ -21,6 +23,7 @@ struct AdvancedView: View {
     @State private var showingStorageInfo = false
     @State private var showingLog = false
     @State private var showSync = false
+    @State private var showShipMany = false
 
     @State private var detected = ProjectInspector.Info()
     @State private var detecting = false
@@ -53,13 +56,29 @@ struct AdvancedView: View {
     private var sidebar: some View {
         VStack(spacing: 0) {
             List(selection: $store.selectedID) {
-                Section("Profiles") {
-                    ForEach(store.profiles.sorted { $0.lastUsed > $1.lastUsed }) { profile in
-                        profileRow(profile).tag(profile.id)
+                Section("Apps") {
+                    // Each app's platform versions together, the extra ones
+                    // indented beneath it — "CriFly" and "CriFly · macOS" read
+                    // as one app shipped twice, not as two strangers.
+                    ForEach(store.listOrder) { entry in
+                        profileRow(entry.profile, nested: entry.nested).tag(entry.id)
                     }
                 }
             }
             .listStyle(.sidebar)
+
+            // What is building, waiting or done — across every app, whichever
+            // one is on screen. Absent until something has been started.
+            if !runs.recent.isEmpty {
+                Divider()
+                ScrollView {
+                    ActivityPanel(store: store, runs: runs, identities: identities)
+                        .padding(.horizontal, Design.Gap.small)
+                        .padding(.vertical, Design.Gap.small)
+                }
+                .frame(maxHeight: 230)
+                .fixedSize(horizontal: false, vertical: true)
+            }
 
             Divider()
 
@@ -76,13 +95,14 @@ struct AdvancedView: View {
                 Spacer(minLength: Design.Gap.medium)
                 sidebarButton("arrow.triangle.2.circlepath", "Sync across Macs") { showSync = true }
                 sidebarButton("info.circle", "Where profiles are stored") { showingStorageInfo = true }
-                sidebarButton("trash", "Delete", danger: true) { store.deleteSelected() }
-                    .disabled(store.profiles.count <= 1)
+                sidebarButton("trash", "Delete", danger: true) { deleteSelected() }
+                    .disabled(store.profiles.count <= 1 || runner.isBusy)
             }
             .padding(.horizontal, Design.Gap.small)
             .padding(.vertical, 7)
         }
-        .disabled(runner.isRunning)
+        // Not disabled while a run is going: each profile has a runner of its
+        // own, so the next app can be set up and started while one builds.
         .alert("Rename profile", isPresented: $renaming) {
             TextField("Name", text: $draftName)
             Button("Cancel", role: .cancel) {}
@@ -115,10 +135,10 @@ struct AdvancedView: View {
         }
     }
 
-    private func profileRow(_ profile: ShipProfile) -> some View {
+    private func profileRow(_ profile: ShipProfile, nested: Bool = false) -> some View {
         let identity = identities.identity(for: profile)
         return HStack(spacing: 9) {
-            profileIcon(profile, icon: identity?.icon)
+            profileIcon(profile, icon: identity?.icon, size: nested ? 20 : 26)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(displayName(for: profile, identity: identity))
@@ -133,7 +153,11 @@ struct AdvancedView: View {
 
             Spacer(minLength: 0)
 
-            if !profile.missingFiles.isEmpty {
+            PlatformMark(platform: profile.knownPlatform)
+
+            if let activity = runs.activity(for: profile.id) {
+                RunBadge(runner: activity)
+            } else if !profile.missingFiles.isEmpty {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 10))
                     .foregroundStyle(Design.warning)
@@ -141,6 +165,7 @@ struct AdvancedView: View {
             }
         }
         .padding(.vertical, 3)
+        .padding(.leading, nested ? 16 : 0)
         .task(id: profile.projectPath + profile.bundleID) {
             guard let found = await identities.load(profile),
                   let name = found.displayName
@@ -153,13 +178,13 @@ struct AdvancedView: View {
 
     /// The app's real icon, or the initial of its name until one is found.
     @ViewBuilder
-    private func profileIcon(_ profile: ShipProfile, icon: NSImage?) -> some View {
+    private func profileIcon(_ profile: ShipProfile, icon: NSImage?, size: CGFloat = 26) -> some View {
         if let icon {
             Image(nsImage: icon)
                 .resizable()
                 .interpolation(.high)
                 .aspectRatio(contentMode: .fill)
-                .frame(width: 26, height: 26)
+                .frame(width: size, height: size)
                 // iOS icons are shipped square and masked by the system; a Mac
                 // icon already has its own rounding baked in and is padded to
                 // the corners, so the same clip leaves it untouched.
@@ -167,10 +192,10 @@ struct AdvancedView: View {
         } else {
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .fill(Design.accent)
-                .frame(width: 26, height: 26)
+                .frame(width: size, height: size)
                 .overlay(
                     Text(String(profile.name.prefix(1)).uppercased())
-                        .font(.system(size: 12, weight: .bold))
+                        .font(.system(size: size * 0.46, weight: .bold))
                         .foregroundStyle(.white),
                 )
         }
@@ -203,6 +228,8 @@ struct AdvancedView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            versionStrip
+            Divider()
 
             ScrollView {
                 VStack(spacing: 14) {
@@ -226,6 +253,9 @@ struct AdvancedView: View {
         .animation(.easeInOut(duration: 0.2), value: runner.result)
         .sheet(isPresented: $showingLog) { logSheet }
         .sheet(isPresented: $showSync) { SyncView(sync: sync) }
+        .sheet(isPresented: $showShipMany) {
+            ShipManyView(store: store, runs: runs, identities: identities) { showShipMany = false }
+        }
         // Read the project on arrival and whenever another profile is selected.
         // Detection state is per-view, not stored, so without this a freshly
         // opened window shows a scheme text field instead of the project's
@@ -257,8 +287,8 @@ struct AdvancedView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if !detected.extensionBundleIDs.isEmpty {
-                        Pill(text: "+\(detected.extensionBundleIDs.count) extension",
+                    if !shippedExtensions.isEmpty {
+                        Pill(text: "+\(shippedExtensions.count) extension",
                              color: .secondary)
                     }
                 }
@@ -287,15 +317,48 @@ struct AdvancedView: View {
                 .help("Marketing version and build number this run would ship")
             }
 
+            ActionButton(title: runs.busyCount > 0 ? "Ship many · \(runs.busyCount)" : "Ship many",
+                         symbol: "square.stack.3d.up.fill", tint: Design.accentSolid,
+                         prominent: true) { showShipMany = true }
+                .help("Build or upload several apps at once — up to \(runs.limit) side by side")
+
             QuietButton(title: "Builds", symbol: "tray.full") { Builds.open() }
                 .help("Open the folder every finished build is kept in")
 
             QuietButton(title: "Simple", symbol: "wand.and.stars",
-                        enabled: !runner.isRunning, action: onSimple)
+                        enabled: !runner.isBusy, action: onSimple)
                 .help("Switch to the simple one-screen deploy")
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
+    }
+
+    /// The app's platform versions as tabs, under its name.
+    private var versionStrip: some View {
+        HStack(spacing: Design.Gap.medium) {
+            Text("Versions")
+                .font(Design.Face.label)
+                .foregroundStyle(.secondary)
+            VersionTabs(
+                store: store, runs: runs, currentPlatform: selectedPlatform,
+                canAdd: !detecting && !store.current.projectPath.isEmpty,
+            ) { platform in
+                Task { await addPlatformVersion(platform) }
+            }
+            Spacer(minLength: Design.Gap.small)
+            // iPad is not a platform of its own: say where an iOS build runs,
+            // so nobody goes looking for an iPad tab.
+            if selectedPlatform == .iOS, !detected.deviceFamilies.isEmpty {
+                Label("Runs on \(detected.deviceFamilies.joined(separator: " and "))",
+                      systemImage: detected.deviceFamilies.contains("iPad") ? "ipad.and.iphone" : "iphone")
+                    .font(Design.Face.caption)
+                    .foregroundStyle(.secondary)
+                    .help("From the target's TARGETED_DEVICE_FAMILY. iPhone and iPad ship in one iOS build.")
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .background(Color.primary.opacity(0.018))
     }
 
     /// The real app icon once one has been read, the accent badge until then.
@@ -335,7 +398,7 @@ struct AdvancedView: View {
                 }
             }
             .buttonStyle(.borderless)
-            .disabled(detecting || store.current.projectPath.isEmpty || runner.isRunning),
+            .disabled(detecting || store.current.projectPath.isEmpty || runner.isBusy),
         )) {
             Row("Xcode project") {
                 pathField(
@@ -387,7 +450,9 @@ struct AdvancedView: View {
                 ShipTextField("optional, comma separated", text: store.binding(\.extensionBundleIDsRaw), mono: true)
             }
 
-            Row("Platform") {
+            // "Ships as", not "Platform": this changes what *this* profile
+            // builds, while the Versions strip above adds or opens another.
+            Row("Ships as") {
                 Picker("", selection: platformBinding) {
                     ForEach(ShipPlatform.allCases) { platform in
                         Text(platform.displayName).tag(platform)
@@ -396,7 +461,7 @@ struct AdvancedView: View {
                 .labelsHidden()
                 .pickerStyle(.segmented)
                 .fixedSize()
-                .disabled(runner.isRunning)
+                .disabled(runner.isBusy)
                 if store.current.platformOverride == nil {
                     Pill(text: "detected", color: .secondary)
                 }
@@ -777,7 +842,7 @@ struct AdvancedView: View {
 
     private var runBar: some View {
         VStack(spacing: 0) {
-            if runner.isRunning || runner.finished {
+            if runner.isBusy || runner.finished {
                 stageStrip
                 Divider()
             }
@@ -788,13 +853,24 @@ struct AdvancedView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 160)
-                .disabled(runner.isRunning)
+                .disabled(runner.isBusy)
 
                 if !runner.log.isEmpty {
                     QuietButton(title: "Log", symbol: "text.alignleft") { showingLog = true }
                 }
 
                 Spacer(minLength: Design.Gap.medium)
+
+                if runner.isQueued {
+                    HStack(spacing: 5) {
+                        Image(systemName: "clock").font(.system(size: 10))
+                        Text(runner.status).font(Design.Face.label).lineLimit(1)
+                    }
+                    .foregroundStyle(.secondary)
+                    Button("Cancel") { runs.cancelQueued(store.current.id) }
+                        .buttonStyle(.borderless)
+                        .font(.system(size: 11))
+                }
 
                 if runner.failed {
                     // The failure text and the buttons were competing for the
@@ -816,13 +892,13 @@ struct AdvancedView: View {
                 // built from whatever was left in state.
                 ActionButton(
                     title: "Build IPA", symbol: "hammer.fill",
-                    enabled: !runner.isRunning && !detecting,
+                    enabled: !runner.isBusy && !detecting,
                 ) { start(upload: false) }
 
                 PrimaryButton(
-                    title: runner.isRunning ? "Working…" : "Build & Upload",
-                    symbol: runner.isRunning ? "hourglass" : "arrow.up.circle.fill",
-                    enabled: !runner.isRunning && !detecting && configuration == .release,
+                    title: runner.isQueued ? "Queued…" : runner.isRunning ? "Working…" : "Build & Upload",
+                    symbol: runner.isBusy ? "hourglass" : "arrow.up.circle.fill",
+                    enabled: !runner.isBusy && !detecting && configuration == .release,
                 ) { start(upload: true) }
                 .frame(width: 170)
                 .help(detecting ? "Reading the project…"
@@ -985,9 +1061,9 @@ struct AdvancedView: View {
             if store.current.bundleID.isEmpty, !info.bundleID.isEmpty {
                 store.binding(\.bundleID).wrappedValue = info.bundleID
             }
-            if store.current.extensionBundleIDsRaw.isEmpty, !info.extensionBundleIDs.isEmpty {
+            if store.current.extensionBundleIDsRaw.isEmpty, !shippedExtensions.isEmpty {
                 store.binding(\.extensionBundleIDsRaw).wrappedValue =
-                    info.extensionBundleIDs.joined(separator: ", ")
+                    shippedExtensions.joined(separator: ", ")
             }
         }
 
@@ -1003,7 +1079,7 @@ struct AdvancedView: View {
             detectionWarning = true
             detectionNote = "Scheme \(scheme) builds \(info.bundleID), not \(store.current.bundleID)."
         } else if let stray = store.current.extensionBundleIDs.first(where: {
-            !info.extensionBundleIDs.contains($0)
+            !shippedExtensions.contains($0)
         }) {
             detectionWarning = true
             detectionNote = "\(stray) is listed under Extensions, but this scheme does not build it."
@@ -1017,7 +1093,7 @@ struct AdvancedView: View {
         guard !detected.bundleID.isEmpty else { return }
         store.binding(\.bundleID).wrappedValue = detected.bundleID
         store.binding(\.extensionBundleIDsRaw).wrappedValue =
-            detected.extensionBundleIDs.joined(separator: ", ")
+            shippedExtensions.joined(separator: ", ")
         detectionWarning = false
         detectionNote = "Detected \(detected.summary)"
     }
@@ -1111,6 +1187,13 @@ struct AdvancedView: View {
         store.current.shipPlatform(detected: detected.platform)
     }
 
+    /// What the scheme embeds when built for the platform this run ships as —
+    /// not for the one detection resolved it for. See
+    /// `ProjectInspector.Info.extensionBundleIDs(shippingAs:)`.
+    private var shippedExtensions: [String] {
+        detected.extensionBundleIDs(shippingAs: selectedPlatform)
+    }
+
     /// Writes the segmented picker's choice back to the profile as an explicit
     /// override, so it persists and the other platform can be shipped next time.
     private var platformBinding: Binding<ShipPlatform> {
@@ -1125,7 +1208,48 @@ struct AdvancedView: View {
     /// `reconcileScheme(with:)`.
     private func choose(_ platform: ShipPlatform) {
         store.binding(\.platformRaw).wrappedValue = platform.rawValue
+        // The same scheme building the other platform embeds a different set
+        // of targets — the iPhone build's Watch app is no part of a Mac one.
+        if schemeBuilds(platform), !detected.bundleID.isEmpty {
+            store.binding(\.extensionBundleIDsRaw).wrappedValue =
+                detected.extensionBundleIDs(shippingAs: platform).joined(separator: ", ")
+        }
         Task { await reconcileScheme(with: platform) }
+    }
+
+    /// Make a second profile for this app on `platform`, pointed at the scheme
+    /// that builds it, and switch to it.
+    ///
+    /// The search runs here, against what this screen already detected, so
+    /// the new profile arrives with the right scheme and identifiers instead
+    /// of a copy of this one's that the next detection then has to argue with.
+    /// Nothing found still makes the profile: the Mac app may live in another
+    /// project entirely, and choosing that project is the next step.
+    private func addPlatformVersion(_ platform: ShipPlatform) async {
+        let source = store.current
+        guard !source.projectPath.isEmpty, !detecting else { return }
+
+        detecting = true
+        detectionWarning = false
+        detectionNote = "Looking for the scheme that builds \(platform.displayName)…"
+        let found = detected.schemes.isEmpty ? nil : await ProjectInspector.scheme(
+            forPlatformVersion: platform, of: detected,
+            scheme: source.scheme, projectPath: source.projectPath)
+        detecting = false
+
+        store.addPlatformVersion(
+            of: source.id, platform: platform,
+            scheme: found?.scheme ?? source.scheme,
+            bundleID: found.map { $0.info.bundleID.isEmpty ? source.bundleID : $0.info.bundleID }
+                ?? source.bundleID,
+            extensions: found?.info.extensionBundleIDs(shippingAs: platform) ?? [])
+        // The new profile is now selected, and `.task(id:)` reads it afresh.
+    }
+
+    private func deleteSelected() {
+        guard let id = store.selectedID, !runs.isBusy(id) else { return }
+        store.deleteSelected()
+        runs.forget(id)
     }
 
     /// Whether the scheme as detected can ship as `platform`: what it builds,
@@ -1186,22 +1310,20 @@ struct AdvancedView: View {
         store.markUsed()
         store.save()
 
+        let id = store.current.id
+        let input = Pipeline.Input(
+            profile: store.current,
+            configuration: configuration,
+            platform: selectedPlatform,
+            entitlementsByBundleID: detected.entitlements,
+        )
         // Remember a freshly created identity, so every later build — and
         // every other app on this account — reuses it instead of asking Apple
-        // for another certificate.
-        runner.onIdentityCreated = { path in
-            store.binding(\.identityPath).wrappedValue = path
-        }
-
-        runner.run(
-            input: Pipeline.Input(
-                profile: store.current,
-                configuration: configuration,
-                platform: selectedPlatform,
-                entitlementsByBundleID: detected.entitlements,
-            ),
-            upload: upload,
-        )
+        // for another certificate. By id: by the time it lands, another
+        // profile may well be on screen.
+        runs.submit(id, upload: upload, onIdentityCreated: { [store] path in
+            store.update(id) { $0.identityPath = path }
+        }) { _ in input }
     }
 
     // MARK: - Pieces
@@ -1307,6 +1429,9 @@ final class Runner: ObservableObject {
     @Published private(set) var log = ""
     @Published private(set) var status = "Ready"
     @Published private(set) var isRunning = false
+    /// Waiting in `RunCenter` for a free slot. Counts as busy everywhere a
+    /// second start must be refused.
+    @Published private(set) var isQueued = false
     @Published private(set) var failed = false
     @Published private(set) var finished = false
     @Published private(set) var currentStage: Pipeline.Stage?
@@ -1345,6 +1470,25 @@ final class Runner: ObservableObject {
         return "…\n" + clipped
     }
 
+    /// Running, or queued to run. Either way a second start is refused.
+    var isBusy: Bool { isRunning || isQueued }
+
+    /// How far along the run is, 0…1, for a bar in a list of runs. A stage
+    /// under way counts as half done, so the bar moves when a five-minute
+    /// archive starts rather than only once it ends.
+    var progress: Double {
+        guard !steps.isEmpty else { return finished && !failed ? 1 : 0 }
+        if finished && !failed { return 1 }
+        let underway = currentStage != nil && !failed ? 0.5 : 0
+        return min(1, (Double(completed.count) + underway) / Double(steps.count))
+    }
+
+    /// "3 of 7" for the stage under way, or nil before the first one.
+    var stagePosition: String? {
+        guard let stage = currentStage, let index = steps.firstIndex(of: stage) else { return nil }
+        return "\(index + 1) of \(steps.count)"
+    }
+
     func state(of stage: Pipeline.Stage) -> StageState {
         if completed.contains(stage) { return .done }
         if currentStage == stage { return failed ? .failed : .active }
@@ -1352,6 +1496,7 @@ final class Runner: ObservableObject {
     }
 
     func fail(_ short: String, detail: String) {
+        isQueued = false
         failed = true
         finished = true
         steps = []
@@ -1359,14 +1504,56 @@ final class Runner: ObservableObject {
         status = short
         logStore.mutate { $0 = detail + "\n" }
         log = Self.tail(of: detail + "\n")
+        onStateChange?()
     }
 
     /// Set when a run creates a signing identity, so the view can store its
     /// path against the profile.
     var onIdentityCreated: ((String) -> Void)?
 
-    func run(input: Pipeline.Input, upload: Bool) {
+    /// Called whenever this runner starts, queues or finishes, so the pool can
+    /// start whatever is waiting and keep its counts current.
+    var onStateChange: (() -> Void)?
+
+    /// Show the run as waiting for a slot. The screen keeps the stage strip,
+    /// so it is clear what will happen, and says why nothing is moving yet.
+    func markQueued(upload: Bool) {
+        guard !isBusy else { return }
+        isQueued = true
+        failed = false
+        finished = false
+        logStore.mutate { $0 = "" }
+        log = ""
+        completed = []
+        currentStage = nil
+        result = nil
+        steps = Pipeline.Stage.steps(upload: upload)
+        status = "Queued — starts when another app finishes"
+        onStateChange?()
+    }
+
+    /// Take a queued run back out of the queue.
+    func unqueue() {
+        guard isQueued else { return }
+        isQueued = false
+        steps = []
+        status = "Ready"
+        onStateChange?()
+    }
+
+    /// Start a run whose input is only settled once it starts.
+    ///
+    /// A run launched from the screen already has its input: that screen read
+    /// the project. One launched from Ship Many does not — reading a project is
+    /// several `xcodebuild` calls, and doing that for a dozen apps before any of
+    /// them starts would be a long wait for nothing — so it reads its project
+    /// here, inside its own slot, and the log says so.
+    func run(
+        upload: Bool, revealWhenBuilt: Bool = true,
+        input makeInput: @escaping @MainActor (_ log: @escaping @Sendable (String) -> Void) async throws -> Pipeline.Input,
+    ) {
         guard !isRunning else { return }
+        isQueued = false
         isRunning = true
         failed = false
         finished = false
@@ -1377,6 +1564,7 @@ final class Runner: ObservableObject {
         result = nil
         steps = Pipeline.Stage.steps(upload: upload)
         status = upload ? "Building and uploading…" : "Building…"
+        onStateChange?()
 
         // Accumulate output off the main thread; a throttled task copies a
         // bounded tail into `log` a few times a second. Appending per chunk to a
@@ -1406,12 +1594,15 @@ final class Runner: ObservableObject {
         }
 
         task = Task {
-            var pipeline = Pipeline(input: input, log: append)
-            pipeline.onStage = stage
-            pipeline.onIdentityCreated = { [weak self] path in
-                Task { @MainActor in self?.onIdentityCreated?(path) }
-            }
+            var resolved: Pipeline.Input?
             do {
+                let input = try await makeInput(append)
+                resolved = input
+                var pipeline = Pipeline(input: input, log: append)
+                pipeline.onStage = stage
+                pipeline.onIdentityCreated = { [weak self] path in
+                    Task { @MainActor in self?.onIdentityCreated?(path) }
+                }
                 if upload {
                     let ipa = try await pipeline.shipToAppStore()
                     if let last = currentStage { completed.insert(last) }
@@ -1426,20 +1617,28 @@ final class Runner: ObservableObject {
                     status = "Built"
                     append("\n✅ \(ipa)\n")
                     result = BuildResult(path: ipa, uploaded: false)
-                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: ipa)])
+                    // Not for a batch: a Finder window per app, popping up as
+                    // each one lands, is noise. The result card still offers it.
+                    if revealWhenBuilt {
+                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: ipa)])
+                    }
                 }
             } catch {
                 failed = true
                 status = error.localizedDescription
                 append("\n❌ \(error.localizedDescription)\n")
                 // Record the failure so it can be read back — and fixed — from
-                // any machine, not just the one that produced it.
-                ErrorLog.record(input: input, stage: currentStage, error: error, log: store.value)
+                // any machine, not just the one that produced it. A run that
+                // never got as far as an input failed before touching anything.
+                if let resolved {
+                    ErrorLog.record(input: resolved, stage: currentStage, error: error, log: store.value)
+                }
             }
             finished = true
             isRunning = false
             flushTask?.cancel()
             log = Self.tail(of: store.value)   // final flush, so the last lines land
+            onStateChange?()
         }
     }
 }

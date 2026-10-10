@@ -11,11 +11,24 @@ import Foundation
 /// So: a throwaway keychain per run, added to the search list rather than made
 /// default (making it default would change signing behaviour for every other
 /// tool while it exists), and deleted afterwards even if the build fails.
+///
+/// It sits on the search list only while the run is actually signing — see
+/// `attach`. Several apps can build at once, and two of them on one account
+/// hold the *same* identity; with both keychains listed, `codesign` and export
+/// are handed two copies of one certificate and may take either. Importing and
+/// reading the identity name the keychain explicitly, so nothing else needs it
+/// listed.
 actor EphemeralKeychain {
 
     private let name: String
     private let password: String
     private var created = false
+    private var attached = false
+
+    /// Serialises every read-modify-write of the user's search list across
+    /// runs. Without it two runs both read the list, both write it back, and
+    /// the second write drops whatever the first one added.
+    private static let searchList = AsyncLock()
 
     init() {
         // Unique per run so two concurrent builds cannot collide, and so a
@@ -39,19 +52,47 @@ actor EphemeralKeychain {
         // No auto-lock timeout: a long archive must not have the keychain lock
         // out from under it half way through signing.
         _ = await Shell.run("/usr/bin/security", ["set-keychain-settings", name])
+        log("Created temporary keychain \(name)\n")
+    }
 
-        // Append to the user's search list. Deliberately not `default-keychain`,
-        // which would redirect every other tool's lookups for as long as it exists.
+    /// Put this keychain on the user's search list, so `codesign` and
+    /// `xcodebuild -exportArchive` — which take an identity by hash or by name,
+    /// never by keychain — can find it.
+    ///
+    /// Callers hold the pipeline's signing lock for as long as this keychain
+    /// stays attached, so it is the only one of ours listed. Any other
+    /// `mailboxship-` entry is a leftover from a run that crashed, and is
+    /// dropped exactly as before.
+    func attach() async {
+        guard created, !attached else { return }
+        await Self.searchList.run {
+            // Appended, deliberately not `default-keychain`, which would
+            // redirect every other tool's lookups for as long as it exists.
+            let others = await Self.listedKeychains().filter { !$0.contains("mailboxship-") }
+            _ = await Shell.run(
+                "/usr/bin/security", ["list-keychains", "-d", "user", "-s", name] + others)
+        }
+        _ = await Shell.run("/usr/bin/security", ["unlock-keychain", "-p", password, name])
+        attached = true
+    }
+
+    /// Take this keychain back off the search list. Safe to call when it is
+    /// not attached.
+    func detach() async {
+        guard attached else { return }
+        attached = false
+        await Self.searchList.run {
+            let others = await Self.listedKeychains().filter { !$0.contains("mailboxship-") }
+            _ = await Shell.run("/usr/bin/security", ["list-keychains", "-d", "user", "-s"] + others)
+        }
+    }
+
+    private static func listedKeychains() async -> [String] {
         let existing = await Shell.run("/usr/bin/security", ["list-keychains", "-d", "user"])
-        let others = existing.output
+        return existing.output
             .split(separator: "\n")
             .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " \"")) }
-            .filter { !$0.isEmpty && !$0.contains("mailboxship-") }
-
-        _ = await Shell.run(
-            "/usr/bin/security", ["list-keychains", "-d", "user", "-s", name] + others,
-        )
-        log("Created temporary keychain \(name)\n")
+            .filter { !$0.isEmpty }
     }
 
     /// Import a PKCS#12 holding the distribution certificate and its key.
@@ -93,13 +134,7 @@ actor EphemeralKeychain {
         guard created else { return }
         created = false
 
-        let existing = await Shell.run("/usr/bin/security", ["list-keychains", "-d", "user"])
-        let others = existing.output
-            .split(separator: "\n")
-            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " \"")) }
-            .filter { !$0.isEmpty && !$0.contains("mailboxship-") }
-        _ = await Shell.run("/usr/bin/security", ["list-keychains", "-d", "user", "-s"] + others)
-
+        await detach()
         _ = await Shell.run("/usr/bin/security", ["delete-keychain", name])
         log?("Removed temporary keychain \(name)\n")
     }

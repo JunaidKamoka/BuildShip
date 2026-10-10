@@ -45,10 +45,7 @@ enum CLI {
                 exit(2)
             }
 
-            let problems = { () -> [String] in
-                store.selectedID = profile.id
-                return store.problems()
-            }()
+            let problems = store.problems(for: profile)
             guard problems.isEmpty else {
                 FileHandle.standardError.write(
                     Data(("Not ready:\n" + problems.map { "  • \($0)" }
@@ -62,33 +59,9 @@ enum CLI {
 
             // Detection fills in the entitlements map, which is what lets each
             // App ID get exactly the capabilities its own target declares.
-            let (schemes, _) = await ProjectInspector.list(projectPath: profile.projectPath)
-            let scheme = schemes.contains(profile.scheme) ? profile.scheme
-                : (schemes.first ?? profile.scheme)
-            let detected = await ProjectInspector.inspect(
-                projectPath: profile.projectPath, scheme: scheme)
-
-            let input = Pipeline.Input(
-                projectPath: profile.projectPath,
-                scheme: scheme,
-                configuration: configuration,
-                // The CLI always reads the project first, so detection is the
-                // authority here; the saved choice only covers a project that
-                // could not be read at all.
-                platform: detected.platform ?? profile.detectedPlatform ?? profile.platformOverride ?? .iOS,
-                bundleID: profile.bundleID,
-                extensionBundleIDs: profile.extensionBundleIDs,
-                keyPath: profile.keyPath,
-                keyID: profile.keyID,
-                issuerID: profile.issuerID,
-                marketingVersion: profile.marketingVersion,
-                buildNumber: profile.buildNumber,
-                entitlementsByBundleID: detected.entitlements,
-                proxyDictionary: profile.proxy.sessionProxyDictionary,
-                proxyEnvironment: profile.proxy.toolEnvironment,
-                proxyDescription: profile.proxy.redactedDescription,
-                identityPath: profile.identityPath,
-            )
+            // Read the same way a Ship Many run reads it — including a pinned
+            // platform, so a "· macOS" profile ships the Mac app from here too.
+            let input = await RunPlan.resolve(profile, configuration: configuration, log: say).input
 
             // Buffer the log and remember the last stage, so a failure can be
             // recorded to ship-errors.md exactly as the window does.

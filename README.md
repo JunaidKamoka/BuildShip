@@ -67,6 +67,44 @@ ends the screen says what it produced and how big it is, with **Show in Finder**
 you will want to hand over or archive. **Builds** in the title bar opens the
 same folder at any time, including before anything has been run.
 
+## Several apps at once
+
+Each profile has its own run, so starting one no longer locks the list: pick
+another profile and start that too. The profile list shows a spinner, a clock
+(queued), a tick or a cross beside each app, and the **Activity** panel (foot
+of the sidebar; "Other apps" on the simple screen) lists every app started this
+session with its stage and progress — click one to open it. The Dock icon
+shows how many are building.
+
+**Ship many** (title bar; "Deploy several apps…" under Deploy on the simple
+screen) ticks several apps and starts them together.
+At most three build side by side by default (adjustable 1–6 in the same
+sheet); the rest queue and start as slots free up. Each run reads its own
+project when its turn comes, exactly as its own Deploy button would.
+
+Archives, uploads and validation run in parallel. Two steps take turns, on
+purpose: **signing** (a few seconds per app — two runs on one account hold the
+same certificate, and `codesign` must never see two copies of it), and
+**minting a certificate** per account, so parallel runs reuse one identity
+instead of revoking each other's at Apple's cap.
+
+## iPhone, iPad and Mac versions
+
+iPad is not a separate platform — an iOS build runs on whatever
+`TARGETED_DEVICE_FAMILY` names, shown beside the platform as
+"iPhone + iPad".
+
+An app's versions show as tabs under its name — **Versions: iOS · macOS** —
+and sit together in the list, the extra ones indented. For the Mac version of
+an app, use **+ Add → macOS version** (or Mac Catalyst) on that strip. That
+makes a second profile, "App · macOS", pinned to that platform and pointed at
+the scheme that builds it: the same scheme when the
+target is multiplatform, a sibling scheme with the same bundle id (universal
+purchase), or any scheme in the project that builds for the Mac. Key, issuer,
+signing identity and review details carry over; build numbers do not, since
+they are counted per platform. If the Mac app lives in another project, choose
+that project on the new profile. Ship both from **Ship many**.
+
 ## Things that will bite you
 
 **The app record must already exist** in App Store Connect. The API cannot

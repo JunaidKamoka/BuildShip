@@ -89,10 +89,60 @@ enum ProjectInspector {
             }
         }
 
+        /// The embedded targets that ship inside this app when it is built as
+        /// `platform`.
+        ///
+        /// Detection resolves a multiplatform scheme for the platform it
+        /// builds by default, and lists what *that* build embeds — an iPhone
+        /// app's Watch app among them. Shipping the same scheme for the Mac
+        /// embeds no Watch app, and listing one would register and provision a
+        /// watchOS bundle for a Mac upload. So when the run's platform is not
+        /// the detected one, keep only targets that can be built for it.
+        func extensionBundleIDs(shippingAs platform: ShipPlatform) -> [String] {
+            guard let host = self.platform, host != platform else { return extensionBundleIDs }
+            return extensionBundleIDs.filter { bundle in
+                guard let settings = buildSettings[bundle] else { return true }
+                let sdk = (settings["SDKROOT"] ?? settings["PLATFORM_NAME"] ?? "").lowercased()
+                let supported = (settings["SUPPORTED_PLATFORMS"] ?? "").lowercased()
+                func builds(_ name: String) -> Bool { sdk.contains(name) || supported.contains(name) }
+                switch platform {
+                case .iOS: return builds("iphone") || builds("watch")
+                case .macOS: return builds("macosx")
+                case .macCatalyst: return (builds("iphone") || builds("macosx")) && !builds("watch")
+                }
+            }
+        }
+
+        /// The devices an iOS app is built for — iPhone, iPad or both — from
+        /// the app target's `TARGETED_DEVICE_FAMILY`.
+        ///
+        /// iPad is not a platform of its own anywhere Apple ships: an iPad app
+        /// is an iOS build, provisioned against the iOS App ID and uploaded to
+        /// the same record. What decides whether it runs on an iPad is this
+        /// setting, so it is reported beside the platform rather than offered
+        /// as a fourth choice that would build exactly the same thing.
+        var deviceFamilies: [String] {
+            let raw = buildSettings[bundleID]?["TARGETED_DEVICE_FAMILY"] ?? ""
+            return raw.split(whereSeparator: { $0 == "," || $0 == " " }).compactMap {
+                switch $0 {
+                case "1": "iPhone"
+                case "2": "iPad"
+                case "3": "Apple TV"
+                case "4": "Apple Watch"
+                case "6": "Mac"
+                case "7": "Vision Pro"
+                default: nil
+                }
+            }
+        }
+
         var summary: String {
             var parts: [String] = []
             parts.append("\(schemes.count) scheme\(schemes.count == 1 ? "" : "s")")
             if !bundleID.isEmpty { parts.append(bundleID) }
+            if platform == .iOS, !deviceFamilies.isEmpty {
+                parts.append(deviceFamilies.joined(separator: " + "))
+            }
             if !extensionBundleIDs.isEmpty {
                 parts.append("+\(extensionBundleIDs.count) extension\(extensionBundleIDs.count == 1 ? "" : "s")")
             }
@@ -434,6 +484,35 @@ enum ProjectInspector {
         return nil
     }
 
+    /// The scheme a *platform version* of this app should ship from.
+    ///
+    /// Asked when a second profile is made for the same project — the Mac
+    /// version of an iPhone app, say. In order: the scheme already selected,
+    /// when it can build that platform too (one multiplatform target); a
+    /// sibling building the same bundle id (universal purchase); then any
+    /// scheme building for that platform at all, which is how a project
+    /// carrying a separate Mac app under its own identifier is reached. Nil
+    /// when the project builds nothing for the platform.
+    static func scheme(
+        forPlatformVersion platform: ShipPlatform, of info: Info,
+        scheme current: String, projectPath: String,
+    ) async -> (scheme: String, info: Info, sameApp: Bool)? {
+        if info.platform == platform || info.canBuild(platform) == true {
+            return (current, info, true)
+        }
+        if !info.bundleID.isEmpty, let sibling = await scheme(
+            building: info.bundleID, for: platform, among: info.schemes,
+            excluding: current, projectPath: projectPath) {
+            return (sibling.scheme, sibling.info, true)
+        }
+        if let other = await scheme(
+            building: "", for: platform, among: info.schemes,
+            excluding: current, projectPath: projectPath) {
+            return (other.scheme, other.info, other.info.bundleID == info.bundleID)
+        }
+        return nil
+    }
+
     /// `-showBuildSettings -json`, decoded, for whatever selects the targets.
     private static func buildSettings(
         container: [String], selecting arguments: [String],
@@ -605,7 +684,12 @@ enum ProjectInspector {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("MailBoxShip/GeneratedEntitlements", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let file = directory.appendingPathComponent("\(bundle).entitlements")
+        // Per platform as well as per bundle id: the iPhone and Mac targets of
+        // one app share an identifier, can be shipped at the same time, and
+        // need not ask for the same entitlements.
+        let sdk = (settings["PLATFORM_NAME"] as? String ?? "").replacingOccurrences(of: "/", with: "-")
+        let file = directory.appendingPathComponent(
+            sdk.isEmpty ? "\(bundle).entitlements" : "\(bundle).\(sdk).entitlements")
         guard let data = try? PropertyListSerialization.data(
             fromPropertyList: entitlements, format: .xml, options: 0),
             (try? data.write(to: file)) != nil

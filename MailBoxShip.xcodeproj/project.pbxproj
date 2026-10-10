@@ -12,6 +12,7 @@
 		16F43288531B547B46AFF846 /* CLI.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA8B87979D355B3CFCD3E4DC /* CLI.swift */; };
 		1E42311CA0DAA06184715E97 /* ErrorLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD5B7D5022D89E931D533C15 /* ErrorLog.swift */; };
 		2B6ADDDD50B6F8ABA06B7B39 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 271E878FB452AEF07AF6213E /* ContentView.swift */; };
+		32577997BF9018E395265072 /* RunCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9FA9B7417744F4401B4FD2F /* RunCenter.swift */; };
 		3B08EEAC19CB618384F3C462 /* ProjectInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1252A266443D7DAE11F410B /* ProjectInspector.swift */; };
 		3BAF4325CB8D12CC34BCA595 /* Settings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99AB7A05D9A141F62E61B591 /* Settings.swift */; };
 		5154DBDB0DBE7DC99B0D9C58 /* AppIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE48A7C289CE91FF9B1665D0 /* AppIdentity.swift */; };
@@ -23,12 +24,14 @@
 		8B470360F785684678C182F1 /* SyncStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B1242EB64EA84D4DE1E6DC1 /* SyncStore.swift */; };
 		973577256F80FC5BEA3CB564 /* EphemeralKeychain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F021A8F6B6B74841CCBFF8B /* EphemeralKeychain.swift */; };
 		A04AB71B97C0FF0258448A8B /* SyncView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2EA1561F0C804091DE608D50 /* SyncView.swift */; };
+		A9E9CA98531AF4107C2EA877 /* AsyncLock.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EB8DA01212D8211B7674350 /* AsyncLock.swift */; };
 		AAD0A21D6227787540CFD4EE /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE8A072A0215F7B1BF2B63B6 /* RootView.swift */; };
 		DF0D7B73F6C431123D0B2275 /* ProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 965CD717DF29B309EFF55F64 /* ProfileStore.swift */; };
 		E080D9D88168CB752B4B4C18 /* SimpleView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27CF483208287C4A018216C4 /* SimpleView.swift */; };
 		EA50D4EE3828B01565100668 /* Shell.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13B5F80D115016343ED49BF6 /* Shell.swift */; };
 		F04AA2D4006F0C99411F8C11 /* Design.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C98BB037D173007F15F44AB /* Design.swift */; };
 		F12ED5999E44A498C26243A9 /* SecretStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22C46AD31146107E87AD50D8 /* SecretStore.swift */; };
+		F1D0565B489C8DB9E0AB3DE4 /* ShipManyView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FC364101515C1D74E5A89FD /* ShipManyView.swift */; };
 		F6EB37317670E24921EDA9ED /* Deployment.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CF1ADA645E8FC062FAE4A13 /* Deployment.swift */; };
 		FBF85385D351151AB6060248 /* ASCClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CDAF49BC6D223D654815A36E /* ASCClient.swift */; };
 /* End PBXBuildFile section */
@@ -49,8 +52,11 @@
 		965CD717DF29B309EFF55F64 /* ProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileStore.swift; sourceTree = "<group>"; };
 		9750739DB4C2417F70FD2461 /* Capabilities.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Capabilities.swift; sourceTree = "<group>"; };
 		99AB7A05D9A141F62E61B591 /* Settings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Settings.swift; sourceTree = "<group>"; };
+		9EB8DA01212D8211B7674350 /* AsyncLock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AsyncLock.swift; sourceTree = "<group>"; };
+		9FC364101515C1D74E5A89FD /* ShipManyView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShipManyView.swift; sourceTree = "<group>"; };
 		A3FEBA1F9F9052FA835BAF02 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		A6246CF1FDBCB37A17D338D6 /* BuildResult.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuildResult.swift; sourceTree = "<group>"; };
+		A9FA9B7417744F4401B4FD2F /* RunCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunCenter.swift; sourceTree = "<group>"; };
 		AA8B87979D355B3CFCD3E4DC /* CLI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CLI.swift; sourceTree = "<group>"; };
 		BD5B7D5022D89E931D533C15 /* ErrorLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ErrorLog.swift; sourceTree = "<group>"; };
 		C35C813D12F8496BE2A2643C /* ProxyConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyConfig.swift; sourceTree = "<group>"; };
@@ -72,6 +78,7 @@
 				5C98BB037D173007F15F44AB /* Design.swift */,
 				F84F99932128825AE5269E00 /* MailBoxShipApp.swift */,
 				FE8A072A0215F7B1BF2B63B6 /* RootView.swift */,
+				9FC364101515C1D74E5A89FD /* ShipManyView.swift */,
 				27CF483208287C4A018216C4 /* SimpleView.swift */,
 				2EA1561F0C804091DE608D50 /* SyncView.swift */,
 				367C6793E09F6AB8F40EF286 /* Core */,
@@ -85,6 +92,7 @@
 			children = (
 				DE48A7C289CE91FF9B1665D0 /* AppIdentity.swift */,
 				CDAF49BC6D223D654815A36E /* ASCClient.swift */,
+				9EB8DA01212D8211B7674350 /* AsyncLock.swift */,
 				9750739DB4C2417F70FD2461 /* Capabilities.swift */,
 				AA8B87979D355B3CFCD3E4DC /* CLI.swift */,
 				5CF1ADA645E8FC062FAE4A13 /* Deployment.swift */,
@@ -95,6 +103,7 @@
 				965CD717DF29B309EFF55F64 /* ProfileStore.swift */,
 				E1252A266443D7DAE11F410B /* ProjectInspector.swift */,
 				C35C813D12F8496BE2A2643C /* ProxyConfig.swift */,
+				A9FA9B7417744F4401B4FD2F /* RunCenter.swift */,
 				22C46AD31146107E87AD50D8 /* SecretStore.swift */,
 				99AB7A05D9A141F62E61B591 /* Settings.swift */,
 				13B5F80D115016343ED49BF6 /* Shell.swift */,
@@ -199,6 +208,7 @@
 			files = (
 				FBF85385D351151AB6060248 /* ASCClient.swift in Sources */,
 				5154DBDB0DBE7DC99B0D9C58 /* AppIdentity.swift in Sources */,
+				A9E9CA98531AF4107C2EA877 /* AsyncLock.swift in Sources */,
 				64EF9F0180F64ACAE1D6384A /* BuildResult.swift in Sources */,
 				16F43288531B547B46AFF846 /* CLI.swift in Sources */,
 				06E0A41ADBE303B7CE6333B1 /* Capabilities.swift in Sources */,
@@ -214,9 +224,11 @@
 				3B08EEAC19CB618384F3C462 /* ProjectInspector.swift in Sources */,
 				609C92E89EB1FC1211602CD5 /* ProxyConfig.swift in Sources */,
 				AAD0A21D6227787540CFD4EE /* RootView.swift in Sources */,
+				32577997BF9018E395265072 /* RunCenter.swift in Sources */,
 				F12ED5999E44A498C26243A9 /* SecretStore.swift in Sources */,
 				3BAF4325CB8D12CC34BCA595 /* Settings.swift in Sources */,
 				EA50D4EE3828B01565100668 /* Shell.swift in Sources */,
+				F1D0565B489C8DB9E0AB3DE4 /* ShipManyView.swift in Sources */,
 				E080D9D88168CB752B4B4C18 /* SimpleView.swift in Sources */,
 				8B470360F785684678C182F1 /* SyncStore.swift in Sources */,
 				A04AB71B97C0FF0258448A8B /* SyncView.swift in Sources */,

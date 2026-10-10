@@ -74,7 +74,18 @@ struct ShipProfile: Codable, Identifiable, Hashable {
         platformOverride ?? detected ?? detectedPlatform ?? .iOS
     }
 
+    /// The platform to label this profile with in a list, or nil before its
+    /// project has ever been read. Lists show several profiles at once, so
+    /// there is no live detection to consult — only what was saved.
+    var knownPlatform: ShipPlatform? { platformOverride ?? detectedPlatform }
+
     var lastUsed: Date = Date()
+
+    /// Ties the platform versions of one app together — "CriFly" and
+    /// "CriFly · macOS" — so they list side by side and switch as tabs, even
+    /// once one of them is pointed at a different project. Nil until a version
+    /// has been made; profiles sharing a project are grouped regardless.
+    var familyID: UUID?
 
     /// Egress proxy for this profile. Its password lives in the Keychain,
     /// keyed by `proxy.id` — never in this file.
@@ -127,6 +138,7 @@ struct ShipProfile: Codable, Identifiable, Hashable {
         platformRaw = str(.platformRaw)
         detectedPlatformRaw = str(.detectedPlatformRaw)
         lastUsed = (try? c.decodeIfPresent(Date.self, forKey: .lastUsed)) as? Date ?? Date()
+        familyID = try? c.decodeIfPresent(UUID.self, forKey: .familyID)
         proxy = (try? c.decodeIfPresent(ProxyConfig.self, forKey: .proxy)) as? ProxyConfig
             ?? ProxyConfig()
         reviewFirstName = str(.reviewFirstName)
@@ -413,6 +425,130 @@ final class ProfileStore: ObservableObject {
         scheduleSave()
     }
 
+    /// A second profile for the same app on another platform — the Mac version
+    /// of an iPhone app, or the reverse.
+    ///
+    /// Everything account-side carries over: key, issuer, signing identity
+    /// (one Apple Distribution certificate signs iOS and Mac builds alike),
+    /// review contact, and the proxy endpoint on a port of its own. What names
+    /// the build comes from `scheme`, `bundleID` and `extensions` — whatever
+    /// the caller found builds this platform. The platform is pinned, because
+    /// pinning it is the whole point of this profile; version overrides are
+    /// cleared, because build numbers are counted per platform and a leftover
+    /// one would be spent on the wrong upload.
+    ///
+    /// Selects the new profile, and returns its id.
+    @discardableResult
+    func addPlatformVersion(
+        of sourceID: UUID, platform: ShipPlatform,
+        scheme: String, bundleID: String, extensions: [String],
+    ) -> UUID? {
+        guard let sourceIndex = profiles.firstIndex(where: { $0.id == sourceID }) else { return nil }
+        // The source starts the family if it has none yet, so the two stay
+        // grouped whatever project either is later pointed at.
+        let family = profiles[sourceIndex].familyID ?? sourceID
+        profiles[sourceIndex].familyID = family
+        let source = profiles[sourceIndex]
+        var copy = source
+        copy.id = UUID()
+        let password = copy.proxy.password()
+        copy.proxy.id = UUID().uuidString
+        if copy.proxy.isUsable {
+            copy.proxy.port = ProxyConfig.nextStickyPort(excluding: usedProxyPorts)
+        }
+        copy.proxy.savePassword(password)
+        // The same demo login reaches the same app on every platform.
+        let demo = SecretStore.shared.get(source.demoPasswordKey)
+        if !demo.isEmpty { SecretStore.shared.set(demo, for: copy.demoPasswordKey) }
+
+        copy.scheme = scheme
+        copy.bundleID = bundleID
+        copy.extensionBundleIDsRaw = extensions.joined(separator: ", ")
+        copy.platformOverride = platform
+        copy.detectedPlatform = nil
+        copy.marketingVersion = ""
+        copy.buildNumber = ""
+        copy.name = uniqueName("\(Self.baseName(of: source.name)) · \(platform.displayName)")
+        copy.lastUsed = Date()
+
+        profiles.append(copy)
+        selectedID = copy.id
+        scheduleSave()
+        return copy.id
+    }
+
+    /// "CriFly · macOS" → "CriFly", so a version made from a version is named
+    /// after the app rather than stacking platforms.
+    private static func baseName(of name: String) -> String {
+        for platform in ShipPlatform.allCases {
+            let suffix = " · \(platform.displayName)"
+            if name.hasSuffix(suffix) { return String(name.dropLast(suffix.count)) }
+        }
+        return name
+    }
+
+    /// Profiles that are other platform versions of `profile`.
+    func platformVersions(of profile: ShipProfile) -> [ShipProfile] {
+        family(of: profile).filter { $0.id != profile.id }
+    }
+
+    /// `profile` and every version of the same app, iOS first, then macOS,
+    /// then Mac Catalyst — a fixed order, so tabs do not trade places each
+    /// time one of them ships.
+    ///
+    /// Related means a shared family (made with Add platform) or a shared
+    /// project, followed through: a Mac version moved to its own project stays
+    /// with the iPhone app, and so does a duplicate of either.
+    func family(of profile: ShipProfile) -> [ShipProfile] {
+        var members = [profile]
+        var seen: Set<UUID> = [profile.id]
+        var pending = [profile]
+        while let next = pending.popLast() {
+            for other in profiles where !seen.contains(other.id) && Self.related(next, other) {
+                seen.insert(other.id)
+                members.append(other)
+                pending.append(other)
+            }
+        }
+        return members.sorted(by: Self.versionOrder)
+    }
+
+    private static func related(_ a: ShipProfile, _ b: ShipProfile) -> Bool {
+        if let family = a.familyID, family == b.familyID { return true }
+        return !a.projectPath.isEmpty && a.projectPath == b.projectPath
+    }
+
+    private static func versionOrder(_ a: ShipProfile, _ b: ShipProfile) -> Bool {
+        func rank(_ p: ShipProfile) -> Int {
+            p.knownPlatform.flatMap { ShipPlatform.allCases.firstIndex(of: $0) } ?? ShipPlatform.allCases.count
+        }
+        if rank(a) != rank(b) { return rank(a) < rank(b) }
+        return a.name.localizedStandardCompare(b.name) == .orderedAscending
+    }
+
+    /// One row of a profile list.
+    struct ListEntry: Identifiable {
+        let profile: ShipProfile
+        /// A further version of the app listed just above it — drawn indented
+        /// beneath it rather than as an unrelated app.
+        let nested: Bool
+        var id: UUID { profile.id }
+    }
+
+    /// Every profile in list order: apps by most recent use, each app's
+    /// versions together beneath it.
+    var listOrder: [ListEntry] {
+        var seen: Set<UUID> = []
+        var out: [ListEntry] = []
+        for profile in profiles.sorted(by: { $0.lastUsed > $1.lastUsed })
+        where !seen.contains(profile.id) {
+            for (index, member) in family(of: profile).enumerated() where seen.insert(member.id).inserted {
+                out.append(ListEntry(profile: member, nested: index > 0))
+            }
+        }
+        return out
+    }
+
     func deleteSelected() {
         guard let selectedIndex else { return }
         // Remove the Keychain entries too; leaving orphaned secrets behind is
@@ -435,8 +571,23 @@ final class ProfileStore: ObservableObject {
 
     /// Called when a build starts, so the dropdown orders by recency.
     func markUsed() {
-        guard let selectedIndex else { return }
-        profiles[selectedIndex].lastUsed = Date()
+        guard let selectedID else { return }
+        markUsed(selectedID)
+    }
+
+    func markUsed(_ id: UUID) {
+        update(id) { $0.lastUsed = Date() }
+    }
+
+    /// Change one profile by id, whichever is selected.
+    ///
+    /// Several runs can be in flight at once, and each reports back about its
+    /// *own* profile — a signing identity it created, the scheme it settled
+    /// on. Writing through the selection instead would land that on whatever
+    /// happens to be on screen when the run gets there.
+    func update(_ id: UUID, _ body: (inout ShipProfile) -> Void) {
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
+        body(&profiles[index])
         scheduleSave()
     }
 
@@ -621,8 +772,9 @@ final class ProfileStore: ObservableObject {
 
     // MARK: - Validation
 
-    func problems() -> [String] {
-        let p = current
+    func problems() -> [String] { problems(for: current) }
+
+    func problems(for p: ShipProfile) -> [String] {
         var out: [String] = []
         let fm = FileManager.default
 
@@ -637,27 +789,29 @@ final class ProfileStore: ObservableObject {
             out.append("That .p8 file no longer exists")
         }
         if p.keyID.isEmpty { out.append("Enter the Key ID") }
-        else if keyIDLooksWrong { out.append("The Key ID is 10 characters") }
+        else if Self.keyIDLooksWrong(p.keyID) { out.append("The Key ID is 10 characters") }
         // Enforced rather than hinted at: neither can authenticate, and the
         // only other place they are judged is Apple's 401 — which names
         // nothing, arrives after the account work has already started, and
         // reads as a permissions problem with the key itself.
         if p.issuerID.isEmpty { out.append("Enter the Issuer ID") }
-        else if issuerLooksWrong { out.append("The Issuer ID is a UUID, not the Key ID") }
+        else if Self.issuerLooksWrong(p.issuerID) { out.append("The Issuer ID is a UUID, not the Key ID") }
         return out
     }
 
     /// Key IDs are exactly ten characters; catching it here avoids a round trip
     /// that fails with an unexplained 401.
-    var keyIDLooksWrong: Bool {
-        let value = current.keyID
-        return !value.isEmpty && value.count != 10
+    var keyIDLooksWrong: Bool { Self.keyIDLooksWrong(current.keyID) }
+
+    static func keyIDLooksWrong(_ value: String) -> Bool {
+        !value.isEmpty && value.count != 10
     }
 
     /// Issuer IDs are UUIDs. Pasting the Key ID here is the commonest mistake.
-    var issuerLooksWrong: Bool {
-        let value = current.issuerID
-        return !value.isEmpty && UUID(uuidString: value) == nil
+    var issuerLooksWrong: Bool { Self.issuerLooksWrong(current.issuerID) }
+
+    static func issuerLooksWrong(_ value: String) -> Bool {
+        !value.isEmpty && UUID(uuidString: value) == nil
     }
 
     // MARK: - Persistence

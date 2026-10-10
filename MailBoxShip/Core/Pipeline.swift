@@ -148,16 +148,46 @@ struct Pipeline {
     /// Guard the file, not this string.
     static let identityPassphrase = "mailboxship"
 
+    /// Names this run's own scratch folder and provisioning profiles, so
+    /// several apps can be shipped side by side without touching each other's.
+    private let runID = String(UUID().uuidString.prefix(8)).lowercased()
+
+    /// This run's scratch folder: archive, export, DerivedData and the
+    /// certificate request. One per run — a single shared folder meant a second
+    /// app starting up deleted the first one's archive out from under it.
     private var work: URL {
         URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("MailBoxShip", isDirectory: true)
+            .appendingPathComponent("MailBoxShip/Runs/\(runID)", isDirectory: true)
     }
+
+    // MARK: - Shared between concurrent runs
+
+    /// Signing is the one step two runs cannot share. It needs the run's
+    /// keychain on the user's search list, and two runs on one account hold
+    /// the same certificate — listed twice, `codesign` may pick either copy.
+    /// It takes seconds against an archive's minutes, so queueing it costs
+    /// almost nothing and everything slow still runs side by side.
+    private static let signing = AsyncLock()
+
+    /// Minting a certificate, one run per account and type at a time. Two runs
+    /// that both find no identity would otherwise each ask Apple for one —
+    /// and at the cap, the second revokes the certificate the first is about
+    /// to sign with.
+    private static let certificateLocks = KeyedLocks()
+
+    /// Identities used by a run in this session, by team and type, so a run
+    /// queued behind another reuses what that one found or made — even when
+    /// its own API key sits in a different folder from the first one's.
+    private static let sessionIdentities = Locked<[String: String]>([:])
 
     // MARK: - Entry points
 
     /// The reusable result of `prepare` — the account-side setup a build needs.
     private struct BuildContext {
         let client: ASCClient
+        /// The run's temporary keychain, attached to the search list only for
+        /// the signing step.
+        let keychain: EphemeralKeychain
         let team: String
         let certificate: ASCClient.Certificate
         /// The Mac installer identity that signs the `.pkg`, present only on a
@@ -185,13 +215,35 @@ struct Pipeline {
 
     /// Build a signed .ipa and return its path.
     func buildIPA() async throws -> String {
-        let keychain = EphemeralKeychain()
-        // Runs on every exit path. A failed build must not leave a keychain
-        // holding someone else's certificate on this machine.
-        defer { Task { await keychain.destroy(log: log) } }
+        try await inOwnWorkspace {
+            let keychain = EphemeralKeychain()
+            // Runs on every exit path. A failed build must not leave a keychain
+            // holding someone else's certificate on this machine.
+            defer { Task { await keychain.destroy(log: log) } }
 
-        let context = try await prepare(keychain: keychain)
-        return try await assemble(context, buildNumberOverride: nil)
+            let context = try await prepare(keychain: keychain)
+            return try await assemble(context, buildNumberOverride: nil)
+        }
+    }
+
+    /// Run `body`, then delete this run's scratch folder whichever way it
+    /// ended.
+    ///
+    /// Every run now has a folder of its own, and each one holds a full
+    /// DerivedData — left behind, they would add gigabytes per build. The one
+    /// exception is an artifact still sitting inside it, which happens only
+    /// when it could not be copied to the Builds folder.
+    private func inOwnWorkspace(_ body: () async throws -> String) async throws -> String {
+        do {
+            let artifact = try await body()
+            if !artifact.hasPrefix(work.path + "/") {
+                try? FileManager.default.removeItem(at: work)
+            }
+            return artifact
+        } catch {
+            try? FileManager.default.removeItem(at: work)
+            throw error
+        }
     }
 
     /// Team, signing certificate and provisioning profiles — the account work a
@@ -238,7 +290,7 @@ struct Pipeline {
             profileFiles: &profileFiles, devices: &deviceIDs)
 
         return BuildContext(
-            client: client, team: team, certificate: certificate,
+            client: client, keychain: keychain, team: team, certificate: certificate,
             installerCertificate: installerCertificate, profiles: profiles,
             projectInfo: projectInfo, bundleIDRenames: renames,
             signingIdentity: await Self.codesigningIdentityHash(inKeychainAt: keychain.path),
@@ -288,13 +340,26 @@ struct Pipeline {
         // Plist edits stay ahead of signing: the renames rewrite Info.plist,
         // which would invalidate a signature already sealed over it.
         applyBundleIDRenames(inArchiveAt: archivePath, renames: renames)
-        try await embedEntitlements(inArchiveAt: archivePath, team: context.team,
-                                    renames: renames,
-                                    signingIdentity: context.signingIdentity,
-                                    profileFiles: profileFiles,
-                                    extraEntitlements: extraEntitlements)
 
-        return try await export(profiles: complete, team: context.team)
+        // Signing and export, one run at a time. See `signing`.
+        return try await Self.signing.run(whileWaiting: {
+            log("\n  Waiting for another app to finish signing…\n")
+        }) {
+            await context.keychain.attach()
+            do {
+                try await embedEntitlements(inArchiveAt: archivePath, team: context.team,
+                                            renames: renames,
+                                            signingIdentity: context.signingIdentity,
+                                            profileFiles: profileFiles,
+                                            extraEntitlements: extraEntitlements)
+                let artifact = try await export(profiles: complete, team: context.team)
+                await context.keychain.detach()
+                return artifact
+            } catch {
+                await context.keychain.detach()
+                throw error
+            }
+        }
     }
 
     /// Build, validate and upload — bumping the build number and rebuilding on
@@ -306,6 +371,10 @@ struct Pipeline {
     /// the next run.
     @discardableResult
     func shipToAppStore() async throws -> String {
+        try await inOwnWorkspace { try await ship() }
+    }
+
+    private func ship() async throws -> String {
         guard input.configuration == .release else {
             throw ShipError("Only a Release build can be uploaded to App Store Connect.")
         }
@@ -752,6 +821,19 @@ struct Pipeline {
         onStage(.certificate)
         log("→ Preparing \(type.lowercased()) certificate…\n")
 
+        // One run per account and type at a time — see `certificateLocks`.
+        let lock = await Self.certificateLocks.lock(for: "\(team)|\(type)")
+        return try await lock.run(whileWaiting: {
+            log("  Waiting for another app on this account to finish with its certificate…\n")
+        }) {
+            try await obtainCertificate(client: client, keychain: keychain, team: team, type: type)
+        }
+    }
+
+    private func obtainCertificate(
+        client: ASCClient, keychain: EphemeralKeychain, team: String, type: String,
+    ) async throws -> ASCClient.Certificate {
+        let sessionKey = "\(team)|\(type)"
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         let scratchP12 = work.appendingPathComponent("identity.p12").path
 
@@ -775,6 +857,7 @@ struct Pipeline {
         for candidate in [
             input.identityPath,
             Self.identityDestination(near: input.keyPath, team: team, type: type),
+            Self.sessionIdentities.value[sessionKey] ?? "",
         ] {
             guard !candidate.isEmpty, attempted.insert(candidate).inserted,
                   FileManager.default.fileExists(atPath: candidate) else { continue }
@@ -800,6 +883,7 @@ struct Pipeline {
                 try await keychain.importIdentity(
                     p12Path: candidate, p12Password: Self.identityPassphrase)
                 log("  Reusing identity from \((candidate as NSString).lastPathComponent)\n")
+                Self.sessionIdentities.mutate { $0[sessionKey] = candidate }
                 return match
             }
         }
@@ -841,6 +925,7 @@ struct Pipeline {
         try? FileManager.default.removeItem(atPath: destination)
         try? FileManager.default.copyItem(atPath: scratchP12, toPath: destination)
         log("  Saved identity → \(destination)\n")
+        Self.sessionIdentities.mutate { $0[sessionKey] = destination }
         // Only the distribution identity is reported back: that is the one the
         // profile stores and shows. A development identity from a Debug run
         // would replace it there and leave the next Release run naming a
@@ -875,7 +960,8 @@ struct Pipeline {
         guard let begin = source.range(of: "-----BEGIN CERTIFICATE-----") else { return "" }
         let certPEM = String(source[begin.lowerBound...])
 
-        let tmp = NSTemporaryDirectory() + "/mbs-serial.pem"
+        // Named per call: runs read serials concurrently.
+        let tmp = NSTemporaryDirectory() + "/mbs-serial-\(UUID().uuidString).pem"
         try? certPEM.write(toFile: tmp, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(atPath: tmp) }
 
@@ -963,24 +1049,46 @@ struct Pipeline {
     ) async throws -> ASCClient.Certificate {
         let type = "MAC_INSTALLER_DISTRIBUTION"
         log("→ Preparing Mac installer certificate…\n")
+
+        let lock = await Self.certificateLocks.lock(for: "\(team)|\(type)")
+        return try await lock.run(whileWaiting: {
+            log("  Waiting for another app on this account to finish with its installer certificate…\n")
+        }) {
+            try await obtainInstallerCertificate(
+                client: client, keychain: keychain, team: team, type: type)
+        }
+    }
+
+    private func obtainInstallerCertificate(
+        client: ASCClient, keychain: EphemeralKeychain, team: String, type: String,
+    ) async throws -> ASCClient.Certificate {
+        let sessionKey = "\(team)|\(type)"
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
 
         // Reuse the saved installer identity if it still matches a live cert,
         // checked against the account rather than trusted — one revoked
-        // elsewhere would import fine and then fail at signing.
+        // elsewhere would import fine and then fail at signing. The copy beside
+        // this run's key first, then whichever one another run this session
+        // found or made.
         let destination = Self.identityDestination(near: input.keyPath, team: team, type: type)
-        if FileManager.default.fileExists(atPath: destination) {
+        var attempted: Set<String> = []
+        for candidate in [destination, Self.sessionIdentities.value[sessionKey] ?? ""] {
+            guard !candidate.isEmpty, attempted.insert(candidate).inserted,
+                  FileManager.default.fileExists(atPath: candidate) else { continue }
             let live = (try? await client.certificates(type: type)) ?? []
-            let serial = await Self.serial(ofP12: destination)
+            let serial = await Self.serial(ofP12: candidate)
             if !serial.isEmpty,
                let match = live.first(where: {
                    Self.normalisedSerial($0.serialNumber) == Self.normalisedSerial(serial)
                }) {
                 try await keychain.importIdentity(
-                    p12Path: destination, p12Password: Self.identityPassphrase)
-                log("  Reusing installer identity from \((destination as NSString).lastPathComponent)\n")
+                    p12Path: candidate, p12Password: Self.identityPassphrase)
+                log("  Reusing installer identity from \((candidate as NSString).lastPathComponent)\n")
+                Self.sessionIdentities.mutate { $0[sessionKey] = candidate }
                 return match
             }
+        }
+        if !attempted.isEmpty {
             log("  Saved installer identity is no longer valid on the account; requesting a new one\n")
         }
 
@@ -1011,6 +1119,7 @@ struct Pipeline {
         try? FileManager.default.removeItem(atPath: destination)
         try? FileManager.default.copyItem(atPath: scratchP12, toPath: destination)
         log("  Saved installer identity → \(destination)\n")
+        Self.sessionIdentities.mutate { $0[sessionKey] = destination }
         return certificate
     }
 
@@ -1239,8 +1348,12 @@ struct Pipeline {
         }
 
         // Timestamped: profile names are unique per team, and reusing one from a
-        // previous run collides.
-        let name = "Ship \(identifier) \(Int(Date().timeIntervalSince1970))"
+        // previous run collides. The run id as well, because the iPhone and Mac
+        // halves of one app share an identifier and can be provisioned in the
+        // same second — and `createProfile` answers a name clash by taking the
+        // profile already holding the name, which would be the other
+        // platform's.
+        let name = "Ship \(identifier) \(Int(Date().timeIntervalSince1970)) \(runID)"
         let profile = try await client.createProfile(
             name: name,
             type: input.platform.profileType(input.configuration),
