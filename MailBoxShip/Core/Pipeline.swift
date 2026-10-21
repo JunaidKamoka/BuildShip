@@ -696,7 +696,7 @@ struct Pipeline {
     private func preflight() async throws -> ProjectInspector.Info {
         log("→ Checking the project against this app…\n")
         let info = await ProjectInspector.inspect(
-            projectPath: input.projectPath, scheme: input.scheme)
+            projectPath: input.projectPath, scheme: input.scheme, platform: input.platform)
 
         // An unreadable project is not evidence of a mismatch. Let the archive
         // report the real problem rather than blocking on a guess.
@@ -753,6 +753,7 @@ struct Pipeline {
         let isCatalyst = ["IS_MACCATALYST", "SUPPORTS_MACCATALYST"]
             .contains { targetSettings[$0]?.uppercased() == "YES" }
         func canBuild(_ platform: ShipPlatform) -> Bool {
+            if platform == .macCatalyst, isCatalyst, supported.contains("iphoneos") || supported.contains("macosx") { return true }
             guard supported.contains(platform.supportedPlatformName) else { return false }
             switch platform {
             case .iOS: return true
@@ -2093,7 +2094,7 @@ struct Pipeline {
     /// Anything still unresolved is left in place for the caller to reject.
     private func expandProjectVariables(in text: String) async -> String {
         let info = await ProjectInspector.inspect(
-            projectPath: input.projectPath, scheme: input.scheme)
+            projectPath: input.projectPath, scheme: input.scheme, platform: input.platform)
 
         var merged: [String: String] = [:]
         for (_, settings) in info.buildSettings {

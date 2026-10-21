@@ -81,6 +81,9 @@ enum ProjectInspector {
             guard !supported.isEmpty else { return nil }
             let catalyst = ["IS_MACCATALYST", "SUPPORTS_MACCATALYST"]
                 .contains { settings[$0]?.uppercased() == "YES" }
+            // An iOS target that opts into Mac Catalyst lists only iOS platforms when resolved for iOS;
+            // its Catalyst flag is what says it can also ship for the Mac.
+            if platform == .macCatalyst, catalyst, supported.contains("iphoneos") || supported.contains("macosx") { return true }
             guard supported.contains(platform.supportedPlatformName) else { return false }
             switch platform {
             case .iOS: return true
@@ -302,7 +305,24 @@ enum ProjectInspector {
     ///
     /// What the scheme names is not always every target that ships, though, so
     /// the leftovers are asked for separately below.
-    static func inspect(projectPath: String, scheme: String) async -> Info {
+    ///
+    /// Without a destination, `xcodebuild -showBuildSettings` resolves an iOS app that also supports Mac
+    /// Catalyst for the *Mac* — so it reported the app as Mac-only and every iOS run was refused. The
+    /// settings are therefore resolved for an explicit destination: the platform being shipped when
+    /// the caller knows it, otherwise iOS first, falling back to whatever the scheme offers by default
+    /// (a Mac-only scheme has no iOS destination).
+    static func inspect(projectPath: String, scheme: String, platform: ShipPlatform? = nil) async -> Info {
+        if let platform {
+            let resolved = await inspectResolved(projectPath: projectPath, scheme: scheme, destination: platform.archiveDestination)
+            if !resolved.bundleID.isEmpty { return resolved }
+            return await inspectResolved(projectPath: projectPath, scheme: scheme, destination: nil)
+        }
+        let ios = await inspectResolved(projectPath: projectPath, scheme: scheme, destination: ShipPlatform.iOS.archiveDestination)
+        if ios.platform == .iOS { return ios }
+        return await inspectResolved(projectPath: projectPath, scheme: scheme, destination: nil)
+    }
+
+    private static func inspectResolved(projectPath: String, scheme: String, destination: String?) async -> Info {
         var info = Info()
         var hostCameFromScheme = false
         /// Bundle ids whose settings came from the scheme's own targets.
@@ -310,7 +330,7 @@ enum ProjectInspector {
 
         var entries = await buildSettings(
             container: container(forProjectPath: projectPath).arguments,
-            selecting: ["-scheme", scheme])
+            selecting: ["-scheme", scheme] + (destination.map { ["-destination", $0] } ?? []))
         let schemeTargets = Set(entries.compactMap { $0["target"] as? String })
         entries += await settingsForTargetsMissing(from: entries, projectPath: projectPath)
 
