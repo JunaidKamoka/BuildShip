@@ -90,19 +90,25 @@ struct SimpleView: View {
 
         detecting = true
         note = "Looking for the scheme that builds \(platform.displayName)…"; noteWarn = false
+        // The Mac app is often a project of its own beside this one.
         let found = await ProjectInspector.scheme(
             building: detected.bundleID, for: platform,
-            among: detected.schemes, excluding: current, projectPath: path)
+            among: detected.schemes, excluding: current, inOrBeside: path)
+        let other = found == nil
+            ? await ProjectInspector.scheme(building: "", for: platform, besides: path) : nil
         detecting = false
 
         guard let found, store.current.projectPath == path else {
             note = "Scheme \(current) builds for \(builtFor), and no other scheme here builds this app for \(platform.displayName)."
+            if let other {
+                note += " \((other.projectPath as NSString).lastPathComponent) builds \(other.info.bundleID) — choose it if that is this app."
+            }
             noteWarn = true
             return
         }
+        if found.projectPath != path { store.binding(\.projectPath).wrappedValue = found.projectPath }
         store.binding(\.scheme).wrappedValue = found.scheme
-        var info = found.info
-        info.schemes = detected.schemes
+        let info = found.info
         detected = info
         store.binding(\.detectedPlatformRaw).wrappedValue = platform.rawValue
         store.binding(\.platformRaw).wrappedValue = ""
@@ -243,9 +249,16 @@ struct SimpleView: View {
                 if !displayVersion.isEmpty {
                     chip(icon: "number", text: "v\(displayVersion) (\(displayBuild))", good: true)
                 }
-                if !shippedExtensions.isEmpty {
+                // The Watch app is named for what it is, not counted as an
+                // extension: it is the second half of an iPhone + Watch pair.
+                let watchApps = shippedExtensions.filter(detected.watchAppBundleIDs.contains)
+                if !watchApps.isEmpty {
+                    chip(icon: "applewatch", text: "+ Apple Watch app", good: true)
+                }
+                let others = shippedExtensions.count - watchApps.count
+                if others > 0 {
                     chip(icon: "puzzlepiece.extension",
-                         text: "+\(shippedExtensions.count) extension", good: true)
+                         text: "+\(others) extension\(others == 1 ? "" : "s")", good: true)
                 }
                 // iPad is not a platform of its own: an iOS build runs on
                 // whichever devices the target names.
@@ -616,12 +629,31 @@ struct SimpleView: View {
             return
         }
 
-        let scheme = schemes.contains(store.current.scheme) ? store.current.scheme : schemes[0]
+        var scheme = schemes.contains(store.current.scheme) ? store.current.scheme : schemes[0]
         if store.current.scheme != scheme { store.binding(\.scheme).wrappedValue = scheme }
 
         var info = await ProjectInspector.inspect(projectPath: path, scheme: scheme)
         info.schemes = schemes
         detected = info
+
+        // The Watch app's scheme builds only the half that ships inside the
+        // iPhone app, and cannot be archived for iOS. Move to the scheme that
+        // embeds it; a watch-only app has none, and is said so plainly.
+        var watchNote = ""
+        if info.isWatchApp {
+            if let companion = await ProjectInspector.companionScheme(
+                of: info, among: schemes, excluding: scheme, projectPath: path) {
+                watchNote = "Scheme \(scheme) builds the Apple Watch app, which ships inside "
+                    + "\(companion.info.bundleID) — switched to \(companion.scheme). "
+                scheme = companion.scheme
+                store.binding(\.scheme).wrappedValue = scheme
+                info = companion.info
+                info.schemes = schemes
+                detected = info
+            } else {
+                watchNote = "Scheme \(scheme) builds an Apple Watch app, and no iPhone scheme here embeds it. "
+            }
+        }
 
         // Remember the platform, so the next launch knows this is a Mac app
         // before it has had time to read the project again.
@@ -637,11 +669,14 @@ struct SimpleView: View {
 
         // The simple screen has no bundle-id field to reconcile, so it trusts
         // what the scheme actually builds and adopts it outright.
-        if !info.bundleID.isEmpty {
+        if info.isWatchApp {
+            note = watchNote + "Choose the iPhone app's scheme to ship it."
+            noteWarn = true
+        } else if !info.bundleID.isEmpty {
             store.binding(\.bundleID).wrappedValue = info.bundleID
             store.binding(\.extensionBundleIDsRaw).wrappedValue =
                 shippedExtensions.joined(separator: ", ")
-            note = "Ready: \(info.summary)"
+            note = watchNote + "Ready: \(info.summary)"
             noteWarn = false
         } else {
             note = "Could not read a bundle id from scheme \(scheme)."
@@ -699,6 +734,7 @@ struct SimpleView: View {
 
         store.addPlatformVersion(
             of: source.id, platform: platform,
+            projectPath: found?.projectPath ?? source.projectPath,
             scheme: found?.scheme ?? source.scheme,
             bundleID: found.map { $0.info.bundleID.isEmpty ? source.bundleID : $0.info.bundleID }
                 ?? source.bundleID,

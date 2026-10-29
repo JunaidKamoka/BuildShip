@@ -139,15 +139,34 @@ enum ProjectInspector {
             }
         }
 
+        /// Whether the scheme's own app is a watchOS app. A companion Watch
+        /// app never ships from its own scheme — it is embedded in the iPhone
+        /// app and uploaded inside that app's `.ipa` — so this is the cue to
+        /// look for the scheme that embeds it.
+        var isWatchApp: Bool {
+            buildSettings[bundleID].map(ProjectInspector.isWatchApp) ?? false
+        }
+
+        /// The Watch apps among the embedded targets: the iPhone + Apple Watch
+        /// pair, told apart from ordinary extensions so it can be named as such.
+        var watchAppBundleIDs: [String] {
+            extensionBundleIDs.filter { buildSettings[$0].map(ProjectInspector.isWatchApp) ?? false }
+        }
+
         var summary: String {
             var parts: [String] = []
             parts.append("\(schemes.count) scheme\(schemes.count == 1 ? "" : "s")")
             if !bundleID.isEmpty { parts.append(bundleID) }
-            if platform == .iOS, !deviceFamilies.isEmpty {
+            if isWatchApp {
+                parts.append("Apple Watch app")
+            } else if platform == .iOS, !deviceFamilies.isEmpty {
                 parts.append(deviceFamilies.joined(separator: " + "))
             }
-            if !extensionBundleIDs.isEmpty {
-                parts.append("+\(extensionBundleIDs.count) extension\(extensionBundleIDs.count == 1 ? "" : "s")")
+            let watch = watchAppBundleIDs.count
+            if watch > 0 { parts.append("+ Apple Watch app") }
+            let others = extensionBundleIDs.count - watch
+            if others > 0 {
+                parts.append("+\(others) extension\(others == 1 ? "" : "s")")
             }
             return parts.joined(separator: " · ")
         }
@@ -290,6 +309,11 @@ enum ProjectInspector {
             let aIsLocal = targets.contains(a)
             let bIsLocal = targets.contains(b)
             if aIsLocal != bIsLocal { return aIsLocal }
+            // "App Watch App" sorts beside "App", and is the half that ships
+            // inside it — the iPhone app's scheme is the right default.
+            let aIsWatch = a.lowercased().contains("watch")
+            let bIsWatch = b.lowercased().contains("watch")
+            if aIsWatch != bIsWatch { return bIsWatch }
             return a < b
         }
         return (ranked, targets)
@@ -325,6 +349,7 @@ enum ProjectInspector {
     private static func inspectResolved(projectPath: String, scheme: String, destination: String?) async -> Info {
         var info = Info()
         var hostCameFromScheme = false
+        var hostIsWatch = false
         /// Bundle ids whose settings came from the scheme's own targets.
         var settingsCameFromScheme: Set<String> = []
 
@@ -390,9 +415,24 @@ enum ProjectInspector {
             // The scheme is the tiebreak: it names the app being shipped, and
             // the leftovers are read to cover what that app embeds. So once the
             // scheme has produced a host, only the scheme may replace it.
-            let isHost = wrapper == "app" || (info.bundleID.isEmpty && wrapper.isEmpty)
+            //
+            // Since Xcode 14 the Watch app is often a dependency the iPhone
+            // scheme builds itself, so both apps come from the scheme. A Watch
+            // app therefore never displaces an iPhone host; only a scheme that
+            // builds nothing but the Watch app reports it as the host.
+            let watch = isWatchApp(settings.compactMapValues { $0 as? String })
+            let isHost = (wrapper == "app" || (info.bundleID.isEmpty && wrapper.isEmpty))
+                && (!watch || info.bundleID.isEmpty || hostIsWatch)
             if isHost, fromScheme || !hostCameFromScheme {
+                // A host being displaced is still part of the build — the Watch
+                // app read ahead of its iPhone app, typically — so it stays as
+                // an embedded target rather than vanishing.
+                if !info.bundleID.isEmpty, info.bundleID != bundle,
+                   !info.extensionBundleIDs.contains(info.bundleID) {
+                    info.extensionBundleIDs.append(info.bundleID)
+                }
                 hostCameFromScheme = fromScheme
+                hostIsWatch = watch
                 info.bundleID = bundle
                 info.marketingVersion = settings["MARKETING_VERSION"] as? String ?? ""
                 info.buildNumber = settings["CURRENT_PROJECT_VERSION"] as? String ?? ""
@@ -456,6 +496,43 @@ enum ProjectInspector {
         return info
     }
 
+    /// Whether a target is a watchOS app: a classic WatchKit app, or the
+    /// single-target Watch app Xcode 14 and later create, which reports a plain
+    /// application product type and gives itself away by its SDK. The iOS stub
+    /// that wraps a watch-only app is a container, not a Watch app.
+    static func isWatchApp(_ settings: [String: String]) -> Bool {
+        let type = settings["PRODUCT_TYPE"] ?? ""
+        if type.hasSuffix("-container") { return false }
+        if type.hasPrefix("com.apple.product-type.application.watchapp") { return true }
+        let sdk = (settings["SDKROOT"] ?? settings["PLATFORM_NAME"] ?? "").lowercased()
+        return settings["WRAPPER_EXTENSION"] == "app" && sdk.contains("watch")
+    }
+
+    /// The scheme of the iPhone app that ships this Watch app.
+    ///
+    /// Picking the Watch app's own scheme is an easy mistake — it sorts right
+    /// beside the iPhone one — and archiving it for iOS cannot work. The Watch
+    /// target names its companion in `WKCompanionAppBundleIdentifier` when it
+    /// is a modern single target, and that is the scheme wanted; without it,
+    /// any iOS scheme that embeds the Watch app will do. Nil for a watch-only
+    /// app, which has no iPhone app to ship inside.
+    static func companionScheme(
+        of watch: Info, among schemes: [String], excluding current: String, projectPath: String,
+    ) async -> (scheme: String, info: Info)? {
+        let companion = watch.buildSettings[watch.bundleID]?["INFOPLIST_KEY_WKCompanionAppBundleIdentifier"] ?? ""
+        let candidates = schemes.filter { $0 != current }
+            .sorted { !$0.lowercased().contains("watch") && $1.lowercased().contains("watch") }
+        for candidate in candidates {
+            let info = await inspect(projectPath: projectPath, scheme: candidate, platform: .iOS)
+            guard info.platform == .iOS, !info.isWatchApp else { continue }
+            if companion.isEmpty ? info.extensionBundleIDs.contains(watch.bundleID)
+                                 : info.bundleID == companion {
+                return (candidate, info)
+            }
+        }
+        return nil
+    }
+
     /// Whether a target with these settings can ship inside an app built for
     /// `host`. iPhone apps carry their extensions and their Watch app; a Mac
     /// app only Mac code; a Catalyst app its iOS extensions rebuilt for the Mac.
@@ -481,15 +558,7 @@ enum ProjectInspector {
         building bundleID: String, for platform: ShipPlatform,
         among schemes: [String], excluding current: String, projectPath: String,
     ) async -> (scheme: String, info: Info)? {
-        let hints: [String] = switch platform {
-        case .macOS: ["macos", "mac", "osx", "desktop"]
-        case .macCatalyst: ["catalyst", "mac"]
-        case .iOS: ["ios", "iphone", "ipad", "mobile"]
-        }
-        func hinted(_ name: String) -> Bool {
-            let lower = name.lowercased()
-            return hints.contains { lower.contains($0) }
-        }
+        let hinted = { (name: String) in names(name, platform) }
         let candidates = schemes.filter { $0 != current }
             .sorted { hinted($0) && !hinted($1) }
         for candidate in candidates {
@@ -504,6 +573,70 @@ enum ProjectInspector {
         return nil
     }
 
+    /// Whether a scheme or project name suggests `platform` — "AppMac",
+    /// "App-iOS" — so the likely candidate is asked first.
+    private static func names(_ name: String, _ platform: ShipPlatform) -> Bool {
+        let hints: [String] = switch platform {
+        case .macOS: ["macos", "mac", "osx", "desktop"]
+        case .macCatalyst: ["catalyst", "mac"]
+        case .iOS: ["ios", "iphone", "ipad", "mobile"]
+        }
+        let lower = name.lowercased()
+        return hints.contains { lower.contains($0) }
+    }
+
+    /// The other openable projects in the folder `projectPath` sits in, those
+    /// whose name suggests `platform` first.
+    ///
+    /// A Mac app is often a project of its own beside the iPhone one —
+    /// `PrintProMac.xcodeproj` generated from a second XcodeGen spec next to
+    /// `PrintPro.xcodeproj` — and a search that stopped at the chosen project
+    /// reported "no other scheme here builds it" with the answer one file away.
+    static func siblingProjects(of projectPath: String, for platform: ShipPlatform) -> [String] {
+        let directory = (projectPath as NSString).deletingLastPathComponent
+        let own = (projectPath as NSString).standardizingPath
+        return ((try? FileManager.default.contentsOfDirectory(atPath: directory)) ?? [])
+            .filter { $0.hasSuffix(".xcodeproj") }
+            .sorted()
+            .sorted { names($0, platform) && !names($1, platform) }
+            .map { (directory as NSString).appendingPathComponent($0) }
+            .filter { ($0 as NSString).standardizingPath != own && isValidProject($0) }
+    }
+
+    /// A scheme in a project beside this one that builds `bundleID` — any app,
+    /// when empty — for `platform`. The info carries that project's own scheme
+    /// list, since the caller is about to switch to it.
+    static func scheme(
+        building bundleID: String, for platform: ShipPlatform, besides projectPath: String,
+    ) async -> (projectPath: String, scheme: String, info: Info)? {
+        for sibling in siblingProjects(of: projectPath, for: platform) {
+            let (schemes, _) = await list(projectPath: sibling)
+            guard !schemes.isEmpty, var found = await scheme(
+                building: bundleID, for: platform, among: schemes,
+                excluding: "", projectPath: sibling)
+            else { continue }
+            found.info.schemes = schemes
+            return (sibling, found.scheme, found.info)
+        }
+        return nil
+    }
+
+    /// The scheme that builds `bundleID` for `platform`: among this project's
+    /// own schemes first, then in the projects beside it. The info carries the
+    /// scheme list of whichever project it came from.
+    static func scheme(
+        building bundleID: String, for platform: ShipPlatform,
+        among schemes: [String], excluding current: String, inOrBeside projectPath: String,
+    ) async -> (projectPath: String, scheme: String, info: Info)? {
+        if var here = await scheme(
+            building: bundleID, for: platform, among: schemes,
+            excluding: current, projectPath: projectPath) {
+            here.info.schemes = schemes
+            return (projectPath, here.scheme, here.info)
+        }
+        return await scheme(building: bundleID, for: platform, besides: projectPath)
+    }
+
     /// The scheme a *platform version* of this app should ship from.
     ///
     /// Asked when a second profile is made for the same project — the Mac
@@ -511,24 +644,34 @@ enum ProjectInspector {
     /// when it can build that platform too (one multiplatform target); a
     /// sibling building the same bundle id (universal purchase); then any
     /// scheme building for that platform at all, which is how a project
-    /// carrying a separate Mac app under its own identifier is reached. Nil
-    /// when the project builds nothing for the platform.
+    /// carrying a separate Mac app under its own identifier is reached. Each
+    /// of the last two looks in the projects beside this one as well, since
+    /// the Mac app is often a project of its own. Nil when nothing in the
+    /// folder builds for the platform.
     static func scheme(
         forPlatformVersion platform: ShipPlatform, of info: Info,
         scheme current: String, projectPath: String,
-    ) async -> (scheme: String, info: Info, sameApp: Bool)? {
+    ) async -> (projectPath: String, scheme: String, info: Info, sameApp: Bool)? {
         if info.platform == platform || info.canBuild(platform) == true {
-            return (current, info, true)
+            return (projectPath, current, info, true)
         }
-        if !info.bundleID.isEmpty, let sibling = await scheme(
-            building: info.bundleID, for: platform, among: info.schemes,
-            excluding: current, projectPath: projectPath) {
-            return (sibling.scheme, sibling.info, true)
+        if !info.bundleID.isEmpty {
+            if let sibling = await scheme(
+                building: info.bundleID, for: platform, among: info.schemes,
+                excluding: current, projectPath: projectPath) {
+                return (projectPath, sibling.scheme, sibling.info, true)
+            }
+            if let beside = await scheme(building: info.bundleID, for: platform, besides: projectPath) {
+                return (beside.projectPath, beside.scheme, beside.info, true)
+            }
         }
         if let other = await scheme(
             building: "", for: platform, among: info.schemes,
             excluding: current, projectPath: projectPath) {
-            return (other.scheme, other.info, other.info.bundleID == info.bundleID)
+            return (projectPath, other.scheme, other.info, other.info.bundleID == info.bundleID)
+        }
+        if let beside = await scheme(building: "", for: platform, besides: projectPath) {
+            return (beside.projectPath, beside.scheme, beside.info, beside.info.bundleID == info.bundleID)
         }
         return nil
     }

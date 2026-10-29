@@ -349,7 +349,9 @@ struct AdvancedView: View {
             // iPad is not a platform of its own: say where an iOS build runs,
             // so nobody goes looking for an iPad tab.
             if selectedPlatform == .iOS, !detected.deviceFamilies.isEmpty {
-                Label("Runs on \(detected.deviceFamilies.joined(separator: " and "))",
+                Label("Runs on \(detected.deviceFamilies.joined(separator: " and "))"
+                      + (shippedExtensions.contains(where: detected.watchAppBundleIDs.contains)
+                         ? ", with an Apple Watch app" : ""),
                       systemImage: detected.deviceFamilies.contains("iPad") ? "ipad.and.iphone" : "iphone")
                     .font(Design.Face.caption)
                     .foregroundStyle(.secondary)
@@ -1027,12 +1029,31 @@ struct AdvancedView: View {
 
         // Keep the chosen scheme if it is still valid, so re-detecting is not
         // a reset of the user's decision.
-        let scheme = schemes.contains(store.current.scheme) ? store.current.scheme : schemes[0]
+        var scheme = schemes.contains(store.current.scheme) ? store.current.scheme : schemes[0]
         if store.current.scheme != scheme { store.binding(\.scheme).wrappedValue = scheme }
 
         var info = await ProjectInspector.inspect(projectPath: path, scheme: scheme)
         info.schemes = schemes
         detected = info
+
+        // The Watch app's scheme builds only the half that ships inside the
+        // iPhone app, and cannot be archived for iOS. Move to the scheme that
+        // embeds it; a watch-only app has none, and is said so plainly.
+        var watchNote = ""
+        if info.isWatchApp {
+            if let companion = await ProjectInspector.companionScheme(
+                of: info, among: schemes, excluding: scheme, projectPath: path) {
+                watchNote = "Scheme \(scheme) builds the Apple Watch app, which ships inside "
+                    + "\(companion.info.bundleID) — switched to \(companion.scheme). "
+                scheme = companion.scheme
+                store.binding(\.scheme).wrappedValue = scheme
+                info = companion.info
+                info.schemes = schemes
+                detected = info
+            } else {
+                watchNote = "Scheme \(scheme) builds an Apple Watch app, and no iPhone scheme here embeds it. "
+            }
+        }
 
         // Remember the platform, so the next launch knows this is a Mac app
         // before it has had time to read the project again.
@@ -1074,7 +1095,10 @@ struct AdvancedView: View {
         // after a full build, and after App IDs and profiles have been
         // registered for an app that was never being built.
         detectionWarning = false
-        if !info.bundleID.isEmpty, !store.current.bundleID.isEmpty,
+        if info.isWatchApp {
+            detectionWarning = true
+            detectionNote = watchNote + "Choose the iPhone app's scheme to ship it."
+        } else if !info.bundleID.isEmpty, !store.current.bundleID.isEmpty,
            info.bundleID != store.current.bundleID {
             detectionWarning = true
             detectionNote = "Scheme \(scheme) builds \(info.bundleID), not \(store.current.bundleID)."
@@ -1084,7 +1108,7 @@ struct AdvancedView: View {
             detectionWarning = true
             detectionNote = "\(stray) is listed under Extensions, but this scheme does not build it."
         } else {
-            detectionNote = "Detected \(info.summary)"
+            detectionNote = watchNote + "Detected \(info.summary)"
         }
     }
 
@@ -1239,6 +1263,7 @@ struct AdvancedView: View {
 
         store.addPlatformVersion(
             of: source.id, platform: platform,
+            projectPath: found?.projectPath ?? source.projectPath,
             scheme: found?.scheme ?? source.scheme,
             bundleID: found.map { $0.info.bundleID.isEmpty ? source.bundleID : $0.info.bundleID }
                 ?? source.bundleID,
@@ -1277,27 +1302,37 @@ struct AdvancedView: View {
         detecting = true
         detectionWarning = false
         detectionNote = "Looking for the scheme that builds \(platform.displayName)…"
+        // The Mac app is often a project of its own beside this one.
         let found = await ProjectInspector.scheme(
             building: detected.bundleID, for: platform,
-            among: detected.schemes, excluding: current, projectPath: path)
+            among: detected.schemes, excluding: current, inOrBeside: path)
+        // Nothing builds this app there, but a project beside it may build
+        // another app for the platform — a Mac app under its own identifier.
+        let other = found == nil
+            ? await ProjectInspector.scheme(building: "", for: platform, besides: path) : nil
         detecting = false
 
         guard let found, store.current.projectPath == path else {
             detectionWarning = true
             detectionNote = "Scheme \(current) builds for \(builtFor), and no other scheme here builds "
                 + "\(detected.bundleID.isEmpty ? "this app" : detected.bundleID) for \(platform.displayName)."
+            if let other {
+                detectionNote += " \((other.projectPath as NSString).lastPathComponent) builds "
+                    + "\(other.info.bundleID) — choose it if that is this app."
+            }
             return
         }
 
+        if found.projectPath != path { store.binding(\.projectPath).wrappedValue = found.projectPath }
         store.binding(\.scheme).wrappedValue = found.scheme
-        var info = found.info
-        info.schemes = detected.schemes
+        let info = found.info
         detected = info
         store.binding(\.detectedPlatformRaw).wrappedValue = platform.rawValue
         // The platform is now simply what the scheme builds.
         store.binding(\.platformRaw).wrappedValue = ""
         adoptDetectedIdentifiers()
-        detectionNote = "Switched to scheme \(found.scheme) for \(platform.displayName) · \(info.summary)"
+        let project = found.projectPath == path ? "" : " in \((found.projectPath as NSString).lastPathComponent)"
+        detectionNote = "Switched to scheme \(found.scheme)\(project) for \(platform.displayName) · \(info.summary)"
     }
 
     private func start(upload: Bool) {

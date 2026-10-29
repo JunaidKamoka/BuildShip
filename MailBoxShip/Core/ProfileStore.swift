@@ -440,7 +440,7 @@ final class ProfileStore: ObservableObject {
     /// Selects the new profile, and returns its id.
     @discardableResult
     func addPlatformVersion(
-        of sourceID: UUID, platform: ShipPlatform,
+        of sourceID: UUID, platform: ShipPlatform, projectPath: String,
         scheme: String, bundleID: String, extensions: [String],
     ) -> UUID? {
         guard let sourceIndex = profiles.firstIndex(where: { $0.id == sourceID }) else { return nil }
@@ -461,6 +461,7 @@ final class ProfileStore: ObservableObject {
         let demo = SecretStore.shared.get(source.demoPasswordKey)
         if !demo.isEmpty { SecretStore.shared.set(demo, for: copy.demoPasswordKey) }
 
+        copy.projectPath = projectPath
         copy.scheme = scheme
         copy.bundleID = bundleID
         copy.extensionBundleIDsRaw = extensions.joined(separator: ", ")

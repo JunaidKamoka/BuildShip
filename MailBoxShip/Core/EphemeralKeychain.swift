@@ -68,7 +68,7 @@ actor EphemeralKeychain {
         await Self.searchList.run {
             // Appended, deliberately not `default-keychain`, which would
             // redirect every other tool's lookups for as long as it exists.
-            let others = await Self.listedKeychains().filter { !$0.contains("mailboxship-") }
+            guard let others = await Self.otherKeychains() else { return }
             _ = await Shell.run(
                 "/usr/bin/security", ["list-keychains", "-d", "user", "-s", name] + others)
         }
@@ -82,14 +82,34 @@ actor EphemeralKeychain {
         guard attached else { return }
         attached = false
         await Self.searchList.run {
-            let others = await Self.listedKeychains().filter { !$0.contains("mailboxship-") }
+            guard let others = await Self.otherKeychains() else { return }
             _ = await Shell.run("/usr/bin/security", ["list-keychains", "-d", "user", "-s"] + others)
         }
     }
 
-    private static func listedKeychains() async -> [String] {
+    /// The user's search list without any of our keychains, ready to be
+    /// written back — or nil when it could not be read, and must not be.
+    ///
+    /// The list is rewritten wholesale, so a failed or empty read written back
+    /// erases it: the login keychain drops off, and with it the WWDR
+    /// intermediates every later signature chains through. Export then fails
+    /// with "unable to build chain to self-signed root … errSecInternalComponent",
+    /// on every run, until someone puts it back by hand. So a failed read
+    /// writes nothing, and the default keychain is always kept listed.
+    private static func otherKeychains() async -> [String]? {
         let existing = await Shell.run("/usr/bin/security", ["list-keychains", "-d", "user"])
-        return existing.output
+        guard existing.succeeded else { return nil }
+        var others = keychainPaths(in: existing.output).filter { !$0.contains("mailboxship-") }
+        let login = await Shell.run("/usr/bin/security", ["default-keychain", "-d", "user"])
+        if login.succeeded, let path = keychainPaths(in: login.output).first,
+           !path.contains("mailboxship-"), !others.contains(path) {
+            others.insert(path, at: 0)
+        }
+        return others.isEmpty ? nil : others
+    }
+
+    private static func keychainPaths(in output: String) -> [String] {
+        output
             .split(separator: "\n")
             .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " \"")) }
             .filter { !$0.isEmpty }

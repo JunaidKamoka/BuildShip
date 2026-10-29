@@ -187,13 +187,33 @@ enum AppIdentityReader {
 
     /// Biggest file in the set. An `.appiconset` holds the same artwork at a
     /// dozen sizes and the 1024pt marketing icon is always the largest of them,
-    /// so file size picks it without parsing Contents.json.
+    /// so file size picks it.
+    ///
+    /// Except that a single-size set carries dark and tinted variants beside
+    /// the default, and the dark one — a black background — is routinely the
+    /// biggest file: PrintPro's showed black on every row. Contents.json marks
+    /// those with `appearances`, so only the default artwork competes when the
+    /// set says which that is.
     private static func largestImage(in set: URL) -> URL? {
         let keys: [URLResourceKey] = [.fileSizeKey]
         let files = (try? FileManager.default.contentsOfDirectory(
             at: set, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])) ?? []
         let images = files.filter { ["png", "jpg", "jpeg", "heic"].contains($0.pathExtension.lowercased()) }
-        return images.max { byteSize(of: $0) < byteSize(of: $1) }
+        let variants = appearanceVariants(in: set)
+        let plain = images.filter { !variants.contains($0.lastPathComponent) }
+        return (plain.isEmpty ? images : plain).max { byteSize(of: $0) < byteSize(of: $1) }
+    }
+
+    /// The files Contents.json lists for a dark or tinted appearance.
+    private static func appearanceVariants(in set: URL) -> Set<String> {
+        guard let data = try? Data(contentsOf: set.appendingPathComponent("Contents.json")),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entries = json["images"] as? [[String: Any]]
+        else { return [] }
+        return Set(entries.compactMap { entry in
+            guard let appearances = entry["appearances"] as? [Any], !appearances.isEmpty else { return nil }
+            return entry["filename"] as? String
+        })
     }
 
     private static func byteSize(of url: URL) -> Int {
