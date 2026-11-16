@@ -356,6 +356,20 @@ enum ProjectInspector {
         var entries = await buildSettings(
             container: container(forProjectPath: projectPath).arguments,
             selecting: ["-scheme", scheme] + (destination.map { ["-destination", $0] } ?? []))
+
+        // A scheme asked about a destination it cannot build for answers
+        // nothing — a Mac-only scheme probed for iOS, which is what the
+        // iOS-first read above does to every scheme. Going on to the leftover
+        // targets from there invents a host out of whichever app target the
+        // project file happens to list last, in dictionary order. Where an
+        // iPhone app and a Mac app share one bundle id (universal purchase)
+        // that was usually the iPhone app: the Mac scheme was reported as
+        // building for iOS, and choosing macOS found "no other scheme here
+        // builds it" with the right scheme sitting in the list, or selected.
+        // The scheme having nothing to say for this destination is the answer;
+        // the caller falls back to what the scheme builds by default.
+        if entries.isEmpty, destination != nil { return info }
+
         let schemeTargets = Set(entries.compactMap { $0["target"] as? String })
         entries += await settingsForTargetsMissing(from: entries, projectPath: projectPath)
 

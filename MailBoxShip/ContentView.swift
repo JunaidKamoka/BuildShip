@@ -1455,6 +1455,7 @@ final class Runner: ObservableObject {
             switch self {
             case .pending: .secondary
             case .active: Color.accentColor
+                
             case .done: Design.success
             case .failed: Design.failure
             }
