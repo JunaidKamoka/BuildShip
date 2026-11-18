@@ -1350,7 +1350,7 @@ struct AdvancedView: View {
             profile: store.current,
             configuration: configuration,
             platform: selectedPlatform,
-            entitlementsByBundleID: detected.entitlements,
+            entitlementsByBundleID: detected.entitlements(shippingAs: selectedPlatform),
         )
         // Remember a freshly created identity, so every later build — and
         // every other app on this account — reuses it instead of asking Apple

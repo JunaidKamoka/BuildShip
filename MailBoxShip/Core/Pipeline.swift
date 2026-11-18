@@ -2549,12 +2549,23 @@ struct Pipeline {
     /// 90174, but only after an upload attempt — reading the zip's table of
     /// contents costs a moment and gives the same answer here.
     private func verifyProvisioned(ipa: String) async throws {
-        let listing = await Shell.run("/usr/bin/unzip", ["-Z1", ipa])
+        // unzip writes the listing to a file of its own rather than to Shell's
+        // pipe, which carries stderr too: a warning landing between two of
+        // unzip's buffered writes would cut an entry in half, and half of
+        // "Payload/PrinterApp.app/…" reads as a bundle "pp.app" with no profile.
+        let listingPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ship-ipa-listing-\(UUID().uuidString).txt").path
+        defer { try? FileManager.default.removeItem(atPath: listingPath) }
+        let listing = await Shell.run("/bin/sh", [
+            "-c", #"exec /usr/bin/unzip -Z1 "$0" > "$1""#, ipa, listingPath,
+        ])
         // Unreadable listing means the check is unavailable, not that the app
         // is unsigned; leave the verdict to validation.
-        guard listing.succeeded else { return }
+        guard listing.succeeded, let contents = FileManager.default.contents(atPath: listingPath)
+        else { return }
 
-        let entries = Set(listing.output.split(separator: "\n").map(String.init))
+        let entries = Set(String(decoding: contents, as: UTF8.self)
+            .split(separator: "\n").map(String.init))
 
         // Every path component ending in .app or .appex is a bundle that needs
         // its own profile — the host app and each extension it embeds.

@@ -65,6 +65,23 @@ enum ProjectInspector {
         /// Absolute entitlements path per bundle id, so each App ID can be
         /// given exactly the capabilities its own target asks for.
         var entitlements: [String: String] = [:]
+        /// The same map as the project resolves it for *another* platform it can
+        /// ship as. A setting may be conditional on the SDK — an iOS app that
+        /// also ships through Mac Catalyst commonly writes
+        /// `CODE_SIGN_ENTITLEMENTS[sdk=macosx*]` and leaves the plain setting
+        /// empty — so the iOS-first read sees no entitlements at all, and the
+        /// Mac build then shipped carrying only the sandbox fallback: no
+        /// printing, no camera, no photo library.
+        var entitlementsByPlatform: [ShipPlatform: [String: String]] = [:]
+
+        /// Entitlements as resolved for the platform a run actually ships as,
+        /// not the one detection happened to read the project for.
+        func entitlements(shippingAs platform: ShipPlatform) -> [String: String] {
+            guard let other = entitlementsByPlatform[platform], self.platform != platform else {
+                return entitlements
+            }
+            return entitlements.merging(other) { _, forPlatform in forPlatform }
+        }
         /// Resolved build settings per bundle id. Entitlements files reference
         /// project-defined settings — a `$(BASE_PACKAGE_IDENTIFIER)` shared
         /// between an app and its extensions — and only the project can say
@@ -341,8 +358,19 @@ enum ProjectInspector {
             if !resolved.bundleID.isEmpty { return resolved }
             return await inspectResolved(projectPath: projectPath, scheme: scheme, destination: nil)
         }
-        let ios = await inspectResolved(projectPath: projectPath, scheme: scheme, destination: ShipPlatform.iOS.archiveDestination)
-        if ios.platform == .iOS { return ios }
+        var ios = await inspectResolved(projectPath: projectPath, scheme: scheme, destination: ShipPlatform.iOS.archiveDestination)
+        if ios.platform == .iOS {
+            // The caller may go on to ship this for the Mac. Read what the
+            // project declares there too, since SDK-conditional settings
+            // (entitlements above all) are invisible from the iOS side.
+            if ios.canBuild(.macCatalyst) == true {
+                let mac = await inspectResolved(
+                    projectPath: projectPath, scheme: scheme,
+                    destination: ShipPlatform.macCatalyst.archiveDestination)
+                if !mac.entitlements.isEmpty { ios.entitlementsByPlatform[.macCatalyst] = mac.entitlements }
+            }
+            return ios
+        }
         return await inspectResolved(projectPath: projectPath, scheme: scheme, destination: nil)
     }
 

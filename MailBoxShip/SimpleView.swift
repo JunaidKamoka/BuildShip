@@ -710,7 +710,7 @@ struct SimpleView: View {
             profile: store.current,
             configuration: .release,
             platform: selectedPlatform,
-            entitlementsByBundleID: detected.entitlements,
+            entitlementsByBundleID: detected.entitlements(shippingAs: selectedPlatform),
         )
         // By id: by the time a new identity lands, another client may be on
         // screen, and it belongs to the one that made it.

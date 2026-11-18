@@ -240,7 +240,7 @@ enum RunPlan {
         return Resolved(
             input: Pipeline.Input(
                 profile: profile, configuration: configuration,
-                platform: platform, entitlementsByBundleID: info.entitlements),
+                platform: platform, entitlementsByBundleID: info.entitlements(shippingAs: platform)),
             profile: profile)
     }
 }

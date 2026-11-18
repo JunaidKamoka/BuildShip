@@ -54,36 +54,102 @@ enum Shell {
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = pipe
+            let reader = pipe.fileHandleForReading
 
-            let collected = Locked("")
-            pipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-                collected.mutate { $0 += text }
-                onOutput?(text)
+            // Each read is appended in the same critical section that made it.
+            // The handler runs on an arbitrary queue, so a chunk read outside
+            // the lock could be appended after the final drain, splicing the
+            // output at a chunk boundary. That once split
+            // "Payload/PrinterApp.app/…" into "Payload/PrinterA" and "pp.app/…".
+            let capture = Locked(Capture())
+            reader.readabilityHandler = { handle in
+                capture.mutate { $0.take(handle.availableData, streamingTo: onOutput) }
             }
 
             process.terminationHandler = { proc in
-                // Drain whatever landed between the last read and exit.
-                let rest = pipe.fileHandleForReading.readDataToEndOfFile()
-                if !rest.isEmpty, let text = String(data: rest, encoding: .utf8) {
-                    collected.mutate { $0 += text }
-                    onOutput?(text)
+                // Stop the handler, then drain under the lock it reads under:
+                // a chunk it has already read is appended before the drain,
+                // and a call still queued finds the pipe at end of file.
+                reader.readabilityHandler = nil
+                var output = ""
+                capture.mutate {
+                    $0.take(reader.readDataToEndOfFile(), streamingTo: onOutput)
+                    $0.finishStream(to: onOutput)
+                    output = String(decoding: $0.bytes, as: UTF8.self)
                 }
-                pipe.fileHandleForReading.readabilityHandler = nil
                 continuation.resume(
-                    returning: Result(status: proc.terminationStatus, output: collected.value),
+                    returning: Result(status: proc.terminationStatus, output: output),
                 )
             }
 
             do {
                 try process.run()
             } catch {
+                reader.readabilityHandler = nil
                 continuation.resume(
                     returning: Result(status: -1, output: "Could not run \(launchPath): \(error)"),
                 )
             }
         }
+    }
+
+    /// A run's output as raw bytes, decoded only once it is complete.
+    ///
+    /// A pipe read can stop partway through a multi-byte UTF-8 character, and
+    /// decoding such a chunk on its own fails outright: the old per-chunk
+    /// `String(data:encoding:)` returned nil and dropped the whole chunk.
+    private struct Capture {
+        private(set) var bytes = Data()
+        /// The tail of the last chunk, when it stopped partway through a
+        /// character, held back from the live stream until the rest arrives.
+        private var unstreamed = Data()
+
+        mutating func take(_ chunk: Data, streamingTo onOutput: ((String) -> Void)?) {
+            guard !chunk.isEmpty else { return }
+            bytes.append(chunk)
+            guard let onOutput else { return }
+            let pending = unstreamed + chunk
+            let complete = Shell.completeUTF8Prefix(of: pending)
+            unstreamed = pending.suffix(from: pending.startIndex + complete)
+            if complete > 0 {
+                onOutput(String(decoding: pending.prefix(complete), as: UTF8.self))
+            }
+        }
+
+        /// Sends whatever was held back, decoded leniently: the output ended,
+        /// so the rest of that character is never coming.
+        mutating func finishStream(to onOutput: ((String) -> Void)?) {
+            guard !unstreamed.isEmpty else { return }
+            onOutput?(String(decoding: unstreamed, as: UTF8.self))
+            unstreamed = Data()
+        }
+    }
+
+    /// How many leading bytes of `data` end on a UTF-8 character boundary.
+    ///
+    /// A character is at most four bytes, so only a lead byte among the last
+    /// three can begin one that is still incomplete. Bytes that are invalid
+    /// anyway count as complete, so they reach the stream as U+FFFD rather
+    /// than holding it up.
+    static func completeUTF8Prefix(of data: Data) -> Int {
+        let count = data.count
+        var back = 1
+        while back <= min(3, count) {
+            let byte = data[data.startIndex + count - back]
+            // A continuation byte (10xxxxxx): keep looking for the lead byte.
+            if byte & 0b1100_0000 == 0b1000_0000 {
+                back += 1
+                continue
+            }
+            let length = switch byte {
+            case 0xC2...0xDF: 2
+            case 0xE0...0xEF: 3
+            case 0xF0...0xF4: 4
+            default: 1 // ASCII, or a byte no valid character starts with.
+            }
+            return back < length ? count - back : count
+        }
+        return count
     }
 }
 
